@@ -23,6 +23,20 @@ python train.py --eval_only runs/baseline_fixed12.5hz
 Outputs in `runs/<RUN_NAME>/`: `config.json` (all constants + git hash), `log.txt`, `lora/`, `proj.pt`,
 `hyp_<split>.jsonl`, `test_results.json` (WER + measured `audio_tokens_per_sec`).
 
+## Benchmark
+
+`benchmark.py` scores any checkpoint on the Open ASR Leaderboard test sets (the suite of the paper's Table II), using
+the leaderboard's Whisper English normalizer, so the numbers line up with the paper and the leaderboard.
+
+```bash
+python benchmark.py mel:runs/baseline_fixed12.5hz                 # LS clean/other, VoxPopuli, AMI, Earnings-22 (~4 GB)
+python benchmark.py mel:runs/baseline_fixed12.5hz --sets all      # + GigaSpeech, SPGISpeech (~20 GB total)
+python benchmark.py hf:openai/whisper-large-v3 --sets librispeech_clean librispeech_other
+python benchmark.py --table                                       # every results/<tag>/summary.json + paper rows
+```
+
+`--limit N` evaluates N evenly spaced utterances per set for smoke tests. Data is cached in `data/esb/`.
+
 ## What is fixed (the "control")
 
 All knobs are UPPERCASE constants at the top of `train.py`. Change them there, commit, run. Nothing comes from flags.
