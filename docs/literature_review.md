@@ -12,6 +12,9 @@ against the paper directly. Unmarked numbers come from the research pass and hav
 - A-ToMe shows adaptive adjacent merging beats fixed conv subsampling at equal reduction (see table below).
 - Obvious first experiment: A-ToMe-style adjacent merging on the projected mel frames (or inside the
   first few LLM layers), compared against fixed frame stacking at the same average rate.
+- Affinity Pooling (Apr 2026) shows the same win without training, inside a speech LLM: at a 60%
+  token budget, avg WER 5.70 vs 6.41 for linear interpolation. Deep LLM layers tolerate keeping about 5% of
+  tokens, but merging in the middle layers breaks decoding.
 - For learned variable rate: CIF, or CTC-guided collapse (needs an auxiliary CTC head).
 
 ## Core method and vision successors
@@ -66,6 +69,84 @@ against the paper directly. Unmarked numbers come from the research pass and hav
 
 At threshold 0.85: 1.70× faster on GPU, 1.35× on CPU.
 
+### Affinity Pooling: Redundancy in Large Speech Language Models (ACL 2026 Findings) ✅
+
+[2604.06871](https://arxiv.org/abs/2604.06871) · Xiang et al., Beike · Apr 2026 · the most recent paper
+here and the closest to applying merging *inside the LLM*.
+
+**Analysis: where is the redundancy?** They used oracle interventions on Qwen2-Audio (32 layers,
+25 tok/s) and Kimi-Audio (28 layers, 12.5 tok/s), with LibriSpeech test-clean ASR as the probe.
+Speech tokens were compressed within MFA word boundaries, one layer at a time.
+
+- **Redundancy grows with depth.** At layer ≥25, keeping 25.67% of tokens still matches baseline WER.
+  At layers 0–20 the same budget breaks the model.
+- **Middle layers are fragile** (about 5–20). Compressing there causes repetition loops, cross-lingual
+  hallucinations and paraphrasing ("ghost" becomes "spirit"). They read this as the
+  acoustic → semantic transition.
+- **Merging beats dropping, and uniform beats random**: Uniform Merge > Uniform Drop > Random Drop at
+  every layer. So "redundant" tokens still carry some information.
+- **Cosine similarity rises, falls, then rises** with depth. Within a word, adjacent tokens become
+  nearly identical in deep layers.
+
+**Method (Algorithm 1).** One left-to-right pass, kept in time order:
+
+- A token joins the current group if its cosine similarity with **any of the last ω tokens** in that
+  group exceeds τ.
+- Otherwise the group is mean-pooled into one token and a new group starts.
+- ω > 1 lets a group survive brief acoustic jitter. ω = 1 is plain A-ToMe-style adjacent merging.
+- No proportional attention or size tracking: merged tokens are plain means.
+
+**Dual Affinity Pooling (DAP)** applies it twice: at the input embeddings (l=0, ω=1) and at a deep
+layer (l=29 of 32, ω=3). Training-free, prefill only.
+
+| Qwen2-Audio | Final retention | Prefill FLOPs | ASR avg WER | QA avg acc | ST avg BLEU |
+|---|---|---|---|---|---|
+| Vanilla | 100% | 100% | 2.94 | 30.41 | 32.91 |
+| DAP aggressive (τ_in 0.8, τ_deep 0.7) | 14.91% | **72.52%** | 2.95 | 30.82 | 32.54 |
+| DAP conservative (τ_in 0.9, τ_deep 0.8) | 33.76% | 87.89% | 2.90 | 30.46 | 32.90 |
+
+**Comparison at a fixed budget, input layer only (avg WER, KeSpeech + LS clean/other):**
+
+| Kept tokens | Time-stretch audio | Linear interpolation | AP_in |
+|---|---|---|---|
+| 90% | 10.81 | 3.22 | 3.09 |
+| 80% | 12.57 | 3.32 | 3.04 |
+| 70% | 18.73 | 4.18 | 3.56 |
+| 60% | 29.74 | 6.41 | **5.70** |
+
+**Other results**
+
+- **Single layer:** l=30 at τ=0.6 keeps 5.18% of tokens with WER 1.64 (baseline 1.65).
+  Deep groups often span 4–5 words.
+- **Input merging vs the oracle:** at l=0, τ=0.7 keeps 74% of tokens at 1.99 WER. Word-boundary
+  oracle merging keeps 76% at 2.50, so similarity groups work better than word boundaries.
+- **Layer sweep:** l=0 is the only good shallow site. Layers 1–3 degrade even at conservative τ.
+  Deep layers tolerate a wide range of τ.
+- **ω sweep:** at the input, ω > 1 hurts. Deep layers benefit from ω = 3.
+- **Kimi-Audio:** same trends, but smaller gains (DAP aggressive keeps 40.7% of tokens, 79.7% of
+  FLOPs).
+
+**Caveats**
+
+- **Most of the FLOP saving comes from the input merge.** Deep merging at layer 29 only affects the
+  last 3 layers: AP_in alone gives 21.5% fewer FLOPs, AP_deep alone 8.0%. Deep merging mainly saves
+  KV cache.
+- **Speed and memory gains are modest.** "1.7× memory" is the *dynamic* memory increment (1.99 → 1.17 GB)
+  on 40–60 s clips. Peak memory only drops from 33.40 to 32.58 GB. TTFT is ≤1.13× faster, with no gain under 20 s.
+- **Fixed-rate baselines only.** No comparison with ToMe, A-ToMe or SpeechPrune.
+- **Semantic tasks only.** Paralinguistic and acoustic tasks were not evaluated.
+- **Different input from ours.** Their l=0 input is Whisper encoder output, which is already semantic.
+  Our l=0 input is projected mel frames, which are much more acoustic. Their shallow-layer findings
+  may therefore be optimistic for us.
+
+**Relevance here**
+
+- AP_in vs linear interpolation at equal budget is essentially our planned "adaptive vs fixed
+  stacking" experiment, but on a pretrained-encoder model.
+- The deep-layer finding suggests a cheap second experiment: merge inside the LLM at about 90% depth.
+  This needs no training and no change to the input path.
+- Watch for their middle-layer fragility, especially if we merge inside early LLM layers.
+
 ### Mel-LLM: LLM can Read Spectrogram (SLT 2026) ✅
 
 [2606.10231](https://arxiv.org/abs/2606.10231) · closest to this repo's baseline.
@@ -84,7 +165,7 @@ At threshold 0.85: 1.70× faster on GPU, 1.35× on CPU.
 | **CIF** (ICASSP 2020) [1905.11235](https://arxiv.org/abs/1905.11235) | Learned per-frame weight α accumulates until it reaches 1, then fires one integrated vector; trained with a quantity loss | Encoder → decoder connector | ~1 token per output unit | No |
 | **CTC compression** (Gaido et al., EACL 2021) [2102.01578](https://arxiv.org/abs/2102.01578) | Collapse runs of identical CTC predictions (blanks included) by averaging | Mid-encoder | Variable | No |
 | **CJST** (2024) [2411.07607](https://arxiv.org/abs/2411.07607) | CTC peaky alignment: drop blanks, merge non-blank runs; for decoder-only ASR | Adapter into the LLM | Variable | No (supports frozen encoder too) |
-| **Affinity Pooling** (Apr 2026) ✅ exists [2604.06871](https://arxiv.org/abs/2604.06871) | Training-free similarity merging of speech tokens at the input and in deep LLM layers | Speech LLM | ~27% fewer prefill FLOPs | Yes (Whisper-based) |
+| **Affinity Pooling** (ACL Findings 2026) ✅ [2604.06871](https://arxiv.org/abs/2604.06871) · [details above](#affinity-pooling-redundancy-in-large-speech-language-models-acl-2026-findings-) | Training-free windowed adjacent merging at the LLM input and a deep LLM layer | Speech LLM | 27.5% fewer prefill FLOPs, 15% of tokens kept | Yes (Qwen2-Audio, Kimi-Audio) |
 | **ToMe for multilingual Whisper** (arXiv 2026) ✅ exists [2609.13151](https://arxiv.org/abs/2609.13151) | ToMe at inference in the Whisper encoder; 16 languages, 3 sizes, DoRA | Encoder | 20–50% | Yes |
 | **FastAST** (Interspeech 2024) [2406.07676](https://arxiv.org/abs/2406.07676) | ToMe in Audio Spectrogram Transformer + distillation | Encoder | ~2× throughput | No |
 | **VARSTok** (2025) [2509.04685](https://arxiv.org/abs/2509.04685) | Temporal density-peak clustering → variable-length units with implicit duration | Tokenizer | 3–12.5 Hz | No |
@@ -95,6 +176,10 @@ At threshold 0.85: 1.70× faster on GPU, 1.35× on CPU.
 ### Open questions
 
 - **Global or local matching for speech:** ToMe matches across the whole sequence; A-ToMe restricts
-  matching to neighbours to keep frames in time order.
+  matching to neighbours to keep frames in time order. Affinity Pooling sits between them: a short lookback
+  window (ω=3) helps in deep layers but hurts at the input.
+- **Does the "fragile middle layers" pattern hold for encoder-free models?** Affinity Pooling found it
+  in Whisper-based LSLMs. In a mel → LLM model, the acoustic → semantic transition happens inside the LLM itself, so
+  it may move or widen.
 - **CTC blank handling:** drop blanks entirely, or average runs of them? Dropping them can lose
   boundary and prosody information.

@@ -12,7 +12,7 @@ wav ─► 80-d log-mel (25ms win / 10ms hop) ─► MVN (train stats) ─► st
 ## Run
 
 ```bash
-./setup.sh                                   # uv venv + ROCm torch
+./setup_rocm.sh                              # uv venv + ROCm torch
 uv run --no-project --python 3.12 --with pyarrow --with huggingface_hub python prepare_data.py   # ~7 GB
 source .venv/bin/activate
 python train.py --max_steps 10               # smoke test
@@ -66,3 +66,8 @@ All knobs are UPPERCASE constants at the top of `train.py`. Change them there, c
 - Left-padded batched decoding was checked against unbatched decoding: last-step logits match to bf16 precision.
   LFM2's short-conv zeros out padded positions, so padding doesn't leak.
 - `causal_conv1d` kernels aren't available on ROCm, so transformers falls back to `F.conv1d`. It's correct, just slower.
+- On gfx1200, PyTorch's AOTriton flash SDPA kernel can be enabled with
+  `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`. It is ~1.2x faster end-to-end than the math fallback on
+  LFM2.5-350M (batch 4, 512 tokens), with lower peak memory. A prebuilt CK `flash-attn` wheel is available at
+  <https://github.com/tungnguyenlam/flash-attn-gfx1200>, but its backward is slower than AOTriton on this GPU;
+  it is mainly useful for inference and `attn_implementation="flash_attention_2"` compatibility.
