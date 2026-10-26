@@ -3,6 +3,8 @@ Fetch LibriSpeech from the HF parquet mirror (openslr/librispeech_asr) and unpac
 OpenSLR layout: data/LibriSpeech/<split>/<spk>/<chapter>/<id>.flac + <spk>-<chapter>.trans.txt
 (OpenSLR itself is ~10 KB/s from here.) The parquet `audio.bytes` are the original FLAC files, written as-is.
 """
+import shutil
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -14,10 +16,18 @@ SPLITS = {  # HF name -> OpenSLR name
     "test.clean": "test-clean",
     "test.other": "test-other",
     "train.clean.100": "train-clean-100",
+    "validation.other": "dev-other",
+    "train.clean.360": "train-clean-360",
+    "train.other.500": "train-other-500",
 }
 OUT = Path("data/LibriSpeech")
 
-for hf_split, split in SPLITS.items():
+OPTIONAL = {"train.other.500"}  # ~31 GB, only fetched when named on the command line
+# usage: prepare_data.py [split ...]  (HF or OpenSLR names; no args = every split except OPTIONAL)
+splits = ({k: v for k, v in SPLITS.items() if k in sys.argv[1:] or v in sys.argv[1:]} if len(sys.argv) > 1
+          else {k: v for k, v in SPLITS.items() if k not in OPTIONAL})
+
+for hf_split, split in splits.items():
     if (OUT / split / ".done").exists():
         print("skip", split)
         continue
@@ -37,4 +47,5 @@ for hf_split, split in SPLITS.items():
         spk, chap = d.parent.name, d.name
         (d / f"{spk}-{chap}.trans.txt").write_text("".join(f"{i} {t}\n" for i, t in sorted(rows)))
     (OUT / split / ".done").touch()
+    shutil.rmtree(Path(local, "all", hf_split), ignore_errors=True)
     print(split, n, "utterances")

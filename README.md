@@ -79,8 +79,18 @@ python runs.py latest                   # path of the newest run
 | benchmark | Open ASR test sets (below) | ~40 h total | `benchmark.py`, after training |
 
 All splits are speaker-disjoint. **Only LibriSpeech has a train or dev split here.** VoxPopuli, AMI, Earnings-22,
-GigaSpeech and SPGISpeech are test-only (zero-shot, out of domain), and `dev-other` isn't downloaded. The val subset
-is deterministic but narrow (3 speakers, clean read speech), so treat small val WER differences as noise.
+GigaSpeech and SPGISpeech are test-only (zero-shot, out of domain). The val subset is deterministic but narrow (3
+speakers, clean read speech), so treat small val WER differences as noise.
+
+**More corpora:** [docs/DATASETS.md](docs/DATASETS.md) ranks English ASR corpora and audio-understanding datasets
+by annotation quality, with a short summary and a citation (BibTeX) for each. `download_corpora.py --list` shows
+the registry. The default set (≈ 58 GB, keeping `data/` ≤ 100 GB) adds:
+- LibriSpeech `train-clean-360` and `dev-other` (via `prepare_data.py`);
+- AMI IHM, FLEURS en_us and EdAcc;
+- Speech Commands, Clotho-AQA, ESC-50, VocalSound and CREMA-D;
+- the MMAU test-mini and AIR-Bench benchmarks.
+
+These corpora are downloaded but **not wired into `train.py` yet**.
 
 ## Benchmark
 
