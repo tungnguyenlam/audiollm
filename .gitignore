@@ -1,8 +1,9 @@
 .venv/
 data/
 runs/
-__pycache__/
-*.out
 results/
-
+__pycache__/
+.ipynb_checkpoints/
+*.out
+*.log
 .build/

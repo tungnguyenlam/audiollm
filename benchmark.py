@@ -6,15 +6,24 @@ through the Whisper EnglishTextNormalizer, which the leaderboard also uses, so n
 leaderboard and to the paper. That's different from the `[a-z' ]` normalisation in train.py, so expect small
 differences on LibriSpeech.
 
-    python benchmark.py mel:runs/baseline_fixed12.5hz                      # our checkpoint, default sets
+    python benchmark.py mel:runs/baseline_fixed12.5hz                      # our checkpoint, all 7 sets
+    python benchmark.py mel:runs/latest --sets earnings22 ami              # newest run, some sets
     python benchmark.py hf:openai/whisper-large-v3-turbo --sets librispeech_clean --limit 100
-    python benchmark.py --table                                           # all results/ + paper reference rows
+    python benchmark.py --table                 # paper rows + hf baselines + the best run per base LLM, with its config
+    python benchmark.py --table --all_runs      # ... plus every other benchmarked mel: run
+
+"Best run per base LLM": among finished, non-smoke runs in runs/ with the same MODEL (230M, 350M, 1.2B, ...), the one
+with the lowest in-training val WER (dev-clean subset). Selection never looks at test sets. If that run has no
+benchmark results yet, the table shows train.py's own LibriSpeech test WER (marked †) and the command to benchmark it.
 
 Outputs go to results/<tag>/: <set>.jsonl (id, ref, hyp, normalised ref/hyp) and summary.json (WER %, RTFx).
+For mel: runs the per-set WERs are also stored in runs/<id>/summary.json ("benchmark"), shown in runs/INDEX.md and
+plots.png. train.py runs this automatically after training (BENCHMARK_SETS, default "all").
 """
 import argparse
 import io
 import json
+import os
 import time
 from pathlib import Path
 
@@ -39,7 +48,6 @@ SETS = {
     "gigaspeech": ("gigaspeech", "test"),                # 4.3 GB
     "spgispeech": ("spgispeech", "test"),                # 11.6 GB
 }
-DEFAULT_SETS = ["librispeech_clean", "librispeech_other", "voxpopuli", "ami", "earnings22"]
 OPENASR_SETS = list(SETS)  # current leaderboard English short-form suite minus Common Voice (TED-LIUM was dropped)
 
 # Table II of arXiv 2606.10231 (WER %). Their Avg also includes TED-LIUM, so only compare per-set columns.
@@ -71,31 +79,39 @@ def load_set(name, limit=None):
     return items
 
 
-def read_wav(b):
+def read_wav(b, target_sr=16000):
+    """Decode audio bytes to mono float32 at target_sr. Most ESB sets are 16 kHz, but earnings22 is mostly
+    24 / 22.05 kHz, so resample (soxr, high quality) when needed."""
     wav, sr = sf.read(io.BytesIO(b), dtype="float32")
-    assert sr == 16000, sr
-    return wav if wav.ndim == 1 else wav.mean(1)
+    wav = wav if wav.ndim == 1 else wav.mean(1)
+    if sr != target_sr:
+        import soxr
+        wav = soxr.resample(wav, sr, target_sr).astype(np.float32)
+    return wav
 
 
 # ---------------------------------------------------------------- models
 class MelLLM:
     """Our encoder-free checkpoint. Reuses train.py, with its constants overridden from the run's config.json."""
 
-    def __init__(self, run_dir, batch_size):
+    def __init__(self, run_dir, batch_size, loaded=None):
+        """loaded: optional (tokenizer, model, projector) already in memory (train.py benchmarking right after
+        training), otherwise they are loaded from run_dir."""
         import train
-        for k, v in json.load(open(Path(run_dir, "config.json"))).items():
-            if k.isupper():
-                setattr(train, k, v)
+        config = json.load(open(Path(run_dir, "config.json")))
+        config.setdefault("PRECISION", "fp32")  # runs from before PRECISION existed trained fp32 LoRA/projector
+        train.apply_config(config)
         self.t = train
-        self.tok, self.model, self.proj = train.load_model_and_projector(run_dir)
+        self.run_dir = Path(run_dir)
+        self.tok, self.model, self.proj = loaded or train.load_model_and_projector(run_dir)
         self.model.eval()
-        self.mvn = torch.load(Path(train.DATA, f"mvn_{train.TRAIN_SPLIT}_n{train.MVN_N}.pt"))
+        self.mvn = torch.load(train.mvn_cache_path())
         self.prompt_ids = self.tok(train.PROMPT, add_special_tokens=False).input_ids
         self.batch_size = batch_size or train.EVAL_BATCH_SIZE
 
     def features(self, b):
         t = self.t
-        x = (t.extract_log_mel_spectrogram(io.BytesIO(b)) - self.mvn["mean"]) / self.mvn["std"]
+        x = (t.log_mel_from_waveform(read_wav(b, t.SR)) - self.mvn["mean"]) / self.mvn["std"]
         x = torch.cat([x, x.new_zeros((-x.shape[0]) % t.STACK, t.N_MELS)])
         return x.reshape(-1, t.STACK * t.N_MELS)
 
@@ -103,15 +119,19 @@ class MelLLM:
     def transcribe(self, batch):
         t = self.t
         feats = [{"audio": self.features(it["bytes"])} for it in batch]
-        x, mask, _ = t.build_multimodal_inputs(feats, self.model, self.proj, self.tok, self.prompt_ids, is_train=False)
-        out = self.model.generate(inputs_embeds=x, attention_mask=mask, max_new_tokens=t.MAX_NEW_TOKENS,
-                                  do_sample=False, eos_token_id=self.tok.eos_token_id,
-                                  pad_token_id=self.tok.pad_token_id, use_cache=True)
+        with t.compute_context():
+            x, mask, _ = t.build_multimodal_inputs(feats, self.model, self.proj, self.tok, self.prompt_ids,
+                                                   is_train=False)
+            out = self.model.generate(inputs_embeds=x, attention_mask=mask, max_new_tokens=t.MAX_NEW_TOKENS,
+                                      do_sample=False, eos_token_id=self.tok.eos_token_id,
+                                      pad_token_id=self.tok.pad_token_id, use_cache=True)
         return [self.tok.decode(o, skip_special_tokens=True) for o in out]
 
 
 class HFPipeline:
     """Any transformers ASR checkpoint (Whisper, wav2vec2, Moonshine, ...) via the ASR pipeline."""
+
+    run_dir = None
 
     def __init__(self, model_id, batch_size):
         from transformers import pipeline
@@ -130,7 +150,8 @@ class HFPipeline:
 def load_model(spec, batch_size):
     kind, _, name = spec.partition(":")
     if kind == "mel":
-        return MelLLM(name, batch_size), "mel_" + Path(name).name
+        run_dir = Path(os.path.relpath(Path(name).resolve()))  # runs/latest -> runs/<id>, so results stay put
+        return MelLLM(run_dir, batch_size), "mel_" + run_dir.name
     if kind == "hf":
         return HFPipeline(name, batch_size), "hf_" + name.replace("/", "__")
     raise SystemExit(f"model spec must be mel:<run_dir> or hf:<model_id>, got {spec}")
@@ -155,55 +176,180 @@ def run(model, items, normalizer, out_path):
             "rtfx": round(audio_sec / wall, 1)}
 
 
-def print_table():
-    rows = dict(PAPER)
-    for p in sorted(Path(RESULTS).glob("*/summary.json")):
-        rows[p.parent.name] = {k: v["wer"] for k, v in json.load(open(p)).items() if k in SETS}
-    cols = [s for s in OPENASR_SETS if any(s in r for r in rows.values())]
-    print("| model | " + " | ".join(cols) + " | avg (cols present) |")
-    print("|---" * (len(cols) + 2) + "|")
-    for name, r in rows.items():
-        vals = [r.get(c) for c in cols]
-        have = [v for v in vals if v is not None]
-        avg = f"{sum(have) / len(have):.2f}" if len(have) == len(cols) else "–"
-        print(f"| {name} | " + " | ".join("–" if v is None else f"{v:.2f}" for v in vals) + f" | {avg} |")
+def resolve_sets(sets):
+    """"all" -> every set; also accepts a comma-separated string (train.py's BENCHMARK_SETS)."""
+    if isinstance(sets, str):
+        sets = [s for s in sets.split(",") if s]
+    sets = OPENASR_SETS if sets == ["all"] else list(sets)
+    unknown = [s for s in sets if s not in SETS]
+    if unknown:
+        raise SystemExit(f"unknown benchmark sets {unknown}; choose from {list(SETS)} or 'all'")
+    return sets
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", nargs="?", help="mel:<run_dir> or hf:<model_id>")
-    ap.add_argument("--sets", nargs="+", default=DEFAULT_SETS, help=f"subset of {list(SETS)} or 'all'")
-    ap.add_argument("--limit", type=int, default=None, help="evaluate N evenly spaced utterances per set (smoke test)")
-    ap.add_argument("--batch_size", type=int, default=None)
-    ap.add_argument("--tag", default=None, help="results/<tag> (default derived from model)")
-    ap.add_argument("--table", action="store_true", help="print a markdown table of all results and exit")
-    args = ap.parse_args()
+def update_run_summary(run_dir, **values):
+    """Merge values into runs/<id>/summary.json (atomic), so runs.py / INDEX.md / plots.png see benchmark WERs."""
+    path = Path(run_dir, "summary.json")
+    summary = json.load(open(path)) if path.exists() else {}
+    summary.update(values)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(summary, indent=2))
+    tmp.replace(path)
 
-    if args.table:
-        return print_table()
-    if not args.model:
-        ap.error("model is required unless --table")
-    sets = OPENASR_SETS if args.sets == ["all"] else args.sets
 
-    normalizer = WhisperTokenizer.from_pretrained("openai/whisper-large-v3").normalize
-    model, tag = load_model(args.model, args.batch_size)
-    tag = args.tag or tag + (f"_limit{args.limit}" if args.limit else "")
+def benchmark(model, tag, sets, limit=None, log=print, spec=None):
+    """
+    Run `model` on `sets`, writing results/<tag>/<set>.jsonl + summary.json (merged with earlier sets). For a mel:
+    run without --limit, also store {set: WER} under "benchmark" in the run's own summary.json. Returns the summary.
+    """
     out_dir = Path(RESULTS, tag)
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "summary.json"
     summary = json.load(open(summary_path)) if summary_path.exists() else {}
-    summary["_model"] = args.model
-
+    summary["_model"] = f"mel:{model.run_dir}" if model.run_dir else spec  # mel: always the resolved run dir
+    normalizer = WhisperTokenizer.from_pretrained("openai/whisper-large-v3").normalize
+    track_run = model.run_dir is not None and not limit
     for name in sets:
-        items = load_set(name, args.limit)
+        if track_run:
+            update_run_summary(model.run_dir, benchmark_status=f"running {name}")
+        items = load_set(name, limit)
         summary[name] = run(model, items, normalizer, out_dir / f"{name}.jsonl")
-        print(name, summary[name], flush=True)
+        log(f"[benchmark] {name} {summary[name]}")
         json.dump(summary, open(summary_path, "w"), indent=2)
+        if track_run:
+            update_run_summary(model.run_dir, benchmark={s: summary[s]["wer"] for s in OPENASR_SETS if s in summary},
+                               benchmark_results=str(out_dir))
 
     done = [summary[s]["wer"] for s in OPENASR_SETS if s in summary]
     if len(done) == len(OPENASR_SETS):
         summary["mean_wer"] = round(sum(done) / len(done), 2)
         json.dump(summary, open(summary_path, "w"), indent=2)
+    if track_run:
+        update_run_summary(model.run_dir, benchmark_status="done")
+    return summary
+
+
+def load_results():
+    """{tag: summary} for every results/<tag>/summary.json."""
+    return {p.parent.name: json.load(open(p)) for p in sorted(Path(RESULTS).glob("*/summary.json"))}
+
+
+def result_for_run(results, run_dir):
+    """The benchmark result of a run dir: prefer full (non --limit) results, then the one covering most sets."""
+    matches = [
+        (tag, summary) for tag, summary in results.items()
+        if summary.get("_model", "").startswith("mel:")
+        and Path(summary["_model"][4:]).resolve() == Path(run_dir).resolve()
+    ]
+    if not matches:
+        return None, None
+    return max(matches, key=lambda m: ("_limit" not in m[0], sum(s in m[1] for s in SETS), m[0]))
+
+
+def print_table(all_runs=False):
+    """
+    Markdown table: paper rows, hf: baselines, and the best run per base LLM (lowest in-training val WER, see
+    runs.best_runs_by_model). --all_runs adds every other mel: result too. Then the config of each best run.
+    """
+    import runs as runs_lib
+
+    results = load_results()
+    best = runs_lib.best_runs_by_model()
+    rows = dict(PAPER)
+    for tag, summary in results.items():
+        if not summary.get("_model", "").startswith("mel:"):
+            rows[tag] = {k: v["wer"] for k, v in summary.items() if k in SETS}
+
+    best_result_tags = set()
+    train_eval_fallback = {"librispeech_clean": "test-clean", "librispeech_other": "test-other"}
+    for model, (run, _) in best.items():
+        tag, summary = result_for_run(results, run["dir"])
+        best_result_tags.add(tag)
+        row = {k: v["wer"] for k, v in summary.items() if k in SETS} if summary else {}
+        for bench_set, split in train_eval_fallback.items():  # not benchmarked: show train.py's own test eval (†)
+            if bench_set not in row and split in run["summary"].get("test_wer", {}):
+                row[bench_set] = f"{run['summary']['test_wer'][split]:.2f}†"
+        rows[f"**best {model.split('/')[-1]}** ({run['id']})"] = row
+    if all_runs:
+        for tag, summary in results.items():
+            if summary.get("_model", "").startswith("mel:") and tag not in best_result_tags:
+                rows[tag] = {k: v["wer"] for k, v in summary.items() if k in SETS}
+
+    cols = [s for s in OPENASR_SETS if any(s in r for r in rows.values())]
+    print("| model | " + " | ".join(cols) + " | avg (cols present) |")
+    print("|---" * (len(cols) + 2) + "|")
+    for name, r in rows.items():
+        vals = [r.get(c) for c in cols]
+        have = [v for v in vals if isinstance(v, (int, float))]
+        avg = f"{sum(have) / len(have):.2f}" if len(have) == len(cols) else "–"
+        cells = ["–" if v is None else v if isinstance(v, str) else f"{v:.2f}" for v in vals]
+        print(f"| {name} | " + " | ".join(cells) + f" | {avg} |")
+    if any(isinstance(v, str) for r in rows.values() for v in r.values()):
+        print("\n† not benchmarked yet: LibriSpeech WER from train.py's own test eval ([a-z' ] normalisation, "
+              "not the Whisper normaliser)")
+
+    if not best:
+        print(f"\nno finished training runs in {runs_lib.RUNS_DIR}/ yet")
+        return
+    import train  # only for the defaults, to mark which config values a run changed
+    print("\n## Best run per base LLM (selected by in-training val WER; test sets are never used for selection)")
+    for model, (run, n_candidates) in best.items():
+        summary, meta = run["summary"], run["meta"]
+        tag, _ = result_for_run(results, run["dir"])
+        cfg = run["config"]
+        print(f"\n### {model}: {run['dir']}")
+        print(f"- selected: val WER {summary['best_val_wer']:.2f} on {cfg.get('VAL_SPLIT', '?')}[:{cfg.get('VAL_N', '?')}] "
+              f"@ step {summary.get('best_val_step', '?')}/{summary.get('total_steps', '?')}, "
+              f"best of {n_candidates} finished run(s) for this LLM")
+        if summary.get("test_wer"):
+            print("- train.py test eval: " + ", ".join(f"{k} {v:.2f}" for k, v in summary["test_wer"].items()))
+        print(f"- benchmark: results/{tag}/" if tag else f"- benchmark: not run yet -> python benchmark.py mel:{run['dir']}")
+        if meta.get("command"):
+            print(f"- command: `{meta['command']}`")
+        if meta.get("notes") or summary.get("notes"):
+            print(f"- notes: {meta.get('notes') or summary.get('notes')}")
+        if meta.get("git_commit"):
+            print(f"- git: {meta['git_commit'][:10]}{' (dirty)' if meta.get('git_dirty') else ''}")
+        items = [
+            f"{key}={runs_lib.fmt(val)}" + ("*" if train.DEFAULT_CONFIG.get(key, val) != val else "")
+            for key, val in cfg.items() if key not in runs_lib.IGNORED_KEYS
+        ]
+        if "PRECISION" not in cfg:
+            items.append("PRECISION=fp32(implicit,pre-PRECISION run)*")
+        lines, line = [], ""
+        for item in items:
+            if line and len(line) + len(item) + 1 > 110:
+                lines.append(line)
+                line = ""
+            line = f"{line} {item}".strip()
+        print("- config (* = differs from current train.py defaults):")
+        print("\n".join("      " + line for line in lines + [line]))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("model", nargs="?", help="mel:<run_dir> or hf:<model_id>")
+    ap.add_argument("--sets", nargs="+", default=["all"], help=f"subset of {list(SETS)} or 'all'")
+    ap.add_argument("--limit", type=int, default=None, help="evaluate N evenly spaced utterances per set (smoke test)")
+    ap.add_argument("--batch_size", type=int, default=None)
+    ap.add_argument("--tag", default=None, help="results/<tag> (default derived from model)")
+    ap.add_argument("--table", action="store_true",
+                    help="print the results table (best run per base LLM + its config) and exit")
+    ap.add_argument("--all_runs", action="store_true", help="with --table: also list non-best mel: results")
+    args = ap.parse_args()
+
+    if args.table:
+        return print_table(args.all_runs)
+    if not args.model:
+        ap.error("model is required unless --table")
+    sets = resolve_sets(args.sets)
+
+    model, tag = load_model(args.model, args.batch_size)
+    tag = args.tag or tag + (f"_limit{args.limit}" if args.limit else "")
+    benchmark(model, tag, sets, args.limit, log=lambda msg: print(msg, flush=True), spec=args.model)
+    if model.run_dir and not args.limit:
+        import runs as runs_lib
+        runs_lib.refresh_run_views(model.run_dir)
     print_table()
 
 

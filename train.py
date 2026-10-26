@@ -1,22 +1,39 @@
 """
 Baseline: encoder-free Mel -> LLM ASR, fixed-rate time-only chunking (Mel-LLM style, arXiv 2606.10231).
 
-    wav -> 80-dim log-mel (10 ms hop) -> MVN (train stats) -> stack STACK frames (time-only chunk, full freq)
-        -> Linear(STACK*80 -> d_model) -> [BOS][audio tokens]["Transcription:"][text][EOS] -> LFM2.5-2.6B-Base + LoRA
+    wav -> 80-dim log-mel (10 ms hop) -> MVN (train stats) -> stack STACK=16 frames (time-only chunk, full freq)
+        -> Linear(STACK*80 -> d_model) -> [BOS][audio tokens]["Transcription:"][text][EOS] -> LFM2.5-230M-Base + LoRA
 
-Everything that defines a run is a constant at the top of this file. Change it here, not via flags.
+The UPPERCASE constants at the top of this file are the defaults. Every one of them can be overridden with a
+lower-case flag of the same name (LR -> --lr, TEST_SPLITS -> --test_splits a b, GRAD_CKPT -> --no-grad_ckpt).
+`python train.py --help` lists them all.
 
-    python train.py                       # train on train-clean-100, val on dev-clean subset, test on test-clean/other
-    python train.py --max_steps 50        # smoke test
-    python train.py --eval_only runs/X    # re-run test eval from a saved run
+Each training run gets its own directory runs/<YYYYmmdd-HHMMSS>_<run_name>/ with:
+    config.json      resolved config (UPPERCASE keys) + "meta" (command, git commit/dirty, overrides, notes, ...)
+    git_diff.patch   uncommitted changes at launch time (only if the tree was dirty)
+    metrics.jsonl    time series: one JSON row per train log window / val pass / test split
+    summary.json     status (running/done/failed/interrupted), best val WER, test WER, duration
+    log.txt, lora/, proj.pt, hyp_<split>.jsonl, test_results.json
+Compare runs with `python runs.py` (see runs.py --help).
+
+    python train.py                                   # train with the defaults below
+    python train.py --run_name lr3e-4 --lr 3e-4 --notes "higher lr"
+    python train.py --model LiquidAI/LFM2.5-350M --stack 8       # run dir name defaults to <model>_stack<STACK>
+    python train.py --config runs/<id>/config.json --stack 4   # start from a previous run's config, tweak one knob
+    python train.py --max_steps 50                    # smoke test
+    python train.py --eval_only runs/<id>             # re-run test eval with that run's saved config
 """
 import argparse
+import contextlib
 import json
 import math
 import os
 import random
 import re
+import shlex
+import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -26,12 +43,15 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 from peft import LoraConfig, PeftModel, get_peft_model
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import runs as runs_lib
+
 # ---------------------------------------------------------------- config
-RUN_NAME = "baseline_fixed12.5hz"
+RUN_NAME = ""                # run directory suffix; empty = auto "<model>_stack<STACK>" (e.g. LFM2.5-230M-Base_stack16)
 SEED = 0
-MODEL = "LiquidAI/LFM2.5-350M"
+MODEL = "LiquidAI/LFM2.5-230M-Base"  # small model for fast experiments (2.6B-Base is the paper-scale target)
 DATA = "data/LibriSpeech"
 TRAIN_SPLIT = "train-clean-100"
 VAL_SPLIT = "dev-clean"
@@ -45,13 +65,14 @@ N_FFT = 400                  # STFT window size (400 samples = 25 ms at 16 kHz)
 HOP = 160                    # STFT hop size (160 samples = 10 ms at 16 kHz -> 100 frames/s)
 N_MELS = 80                  # Number of mel filterbank channels
 MVN_N = 2000                 # Number of utterances sampled to compute dataset Mean-Variance Normalization stats
-STACK = 8                    # Number of consecutive mel frames stacked per audio token (100 Hz / 8 = 12.5 Hz token rate)
+STACK = 16                   # Mel frames stacked per audio token: 16 -> 1280-d patch (>= 230M hidden 1024) at 100/16 = 6.25 Hz (8 = paper's 12.5 Hz)
 
 # Model and optimization hyperparameters
 PROMPT = "Transcription:"
 LORA_R = 64
 LORA_ALPHA = 128
 LORA_DROPOUT = 0.05
+LORA_TARGETS = "all-linear"  # LLM modules that get LoRA (projector is always fully trained): "all-linear" (PEFT: every nn.Linear in the LLM blocks, i.e. attn q/k/v/out_proj + conv in/out_proj + MLP w1/w2/w3, not lm_head/embeddings) or a comma list e.g. "q_proj,k_proj,v_proj,out_proj"
 LR = 1e-4                    # Peak learning rate: 1e-4 with linear warmup and decay
 WEIGHT_DECAY = 0.0
 WARMUP_STEPS = 200
@@ -65,18 +86,166 @@ EVAL_EVERY = 500             # Evaluate on validation split every N optimizer st
 EVAL_BATCH_SIZE = 16
 MAX_NEW_TOKENS = 200
 NUM_WORKERS = 8
+LOG_N_EXAMPLES = 2           # Number of (ref, hyp) examples printed after each validation pass
+PLOT_EVERY = 100             # Re-draw runs/<id>/plots.png (+ runs/INDEX.md) every N optimizer steps and after each val
+BENCHMARK_SETS = "all"       # After training + test eval, run benchmark.py on these Open ASR sets with the in-memory model: "all", comma list (e.g. "librispeech_clean,ami") or "none"
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
+PRECISION = "bf16"           # bf16: LoRA+proj weights/grads/AdamW states in DTYPE (fastest) | amp: fp32 master weights + DTYPE autocast | fp32: fp32 LoRA+proj, no autocast (pre-2026-10-27 runs)
+
+
+DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+PRECISIONS = ("bf16", "amp", "fp32")  # tuple, so it is not picked up as a config constant
 
 
 def get_config_dictionary():
     """Extract all uppercase global constants into a dictionary for configuration saving."""
-    return {
+    config = {
         key: val
         for key, val in globals().items()
         if key.isupper() and isinstance(val, (int, float, str, list, bool))
     }
+    config["DTYPE"] = str(DTYPE).removeprefix("torch.")  # JSON-serialisable; converted back in apply_config
+    return config
+
+
+DEFAULT_CONFIG = get_config_dictionary()  # snapshot of the constants above, before any override
+
+
+def apply_config(overrides):
+    """
+    Override the module-level config constants (from CLI flags or a saved config.json) and rebuild the
+    globals derived from them. Non-uppercase keys (e.g. "meta") are ignored.
+
+    Returns:
+        list[str]: uppercase keys that are not known config constants (ignored, e.g. from an older config.json).
+    """
+    global MEL_FILTERBANK, STFT_WINDOW
+    unknown_keys = []
+    for key, val in overrides.items():
+        if not key.isupper():
+            continue
+        if key not in DEFAULT_CONFIG:
+            unknown_keys.append(key)
+            continue
+        if key == "DTYPE" and isinstance(val, str):
+            val = DTYPES[val]
+        globals()[key] = val
+    MEL_FILTERBANK = build_htk_mel_filterbank()
+    STFT_WINDOW = torch.hann_window(N_FFT)
+    return unknown_keys
+
+
+def read_constant_comments():
+    """Map each config constant to its trailing `# comment` in this file, used as --help text."""
+    comments = {}
+    for line in Path(__file__).read_text().splitlines():
+        match = re.match(r"^([A-Z][A-Z0-9_]*)\s*=.*?#\s*(.+)$", line)
+        if match:
+            comments[match.group(1)] = match.group(2).strip()
+    return comments
+
+
+def build_arg_parser():
+    """One flag per config constant (lower-cased name), plus run-control flags."""
+    parser = argparse.ArgumentParser(
+        description="Train or evaluate encoder-free Mel-to-LLM ASR model.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    run_group = parser.add_argument_group("run control")
+    run_group.add_argument("--config", type=str, default=None,
+                           help="JSON config to start from (e.g. runs/<id>/config.json); explicit flags still win")
+    run_group.add_argument("--max_steps", type=int, default=None, help="Cap optimizer steps (for smoke tests)")
+    run_group.add_argument("--eval_only", type=str, default=None,
+                           help="Run directory to evaluate without training (loads its config.json)")
+    run_group.add_argument("--notes", type=str, default="", help="Free-text description of the run, saved in config.json")
+
+    hparam_group = parser.add_argument_group("config (defaults = UPPERCASE constants at the top of train.py)")
+    comments = read_constant_comments()
+    for key, default in DEFAULT_CONFIG.items():
+        kwargs = {"dest": key, "default": default, "help": comments.get(key, " ").replace("%", "%%")}
+        if isinstance(default, bool):
+            kwargs["action"] = argparse.BooleanOptionalAction
+        elif isinstance(default, list):
+            kwargs.update(nargs="+", type=type(default[0]) if default else str)
+        elif key == "DTYPE":
+            kwargs["choices"] = list(DTYPES)
+        elif key == "PRECISION":
+            kwargs["choices"] = PRECISIONS
+        else:
+            kwargs["type"] = type(default)
+        hparam_group.add_argument("--" + key.lower(), **kwargs)
+    return parser
+
+
+def parse_args(argv=None):
+    """
+    Resolve the config with precedence: explicit CLI flags > --config file (or the --eval_only run's config.json)
+    > constants at the top of this file.
+
+    Returns:
+        tuple[argparse.Namespace, dict]: parsed args and the resolved config dict (UPPERCASE keys).
+    """
+    parser = build_arg_parser()
+    pre_args, _ = parser.parse_known_args(argv)
+    base_config_path = pre_args.config or (Path(pre_args.eval_only, "config.json") if pre_args.eval_only else None)
+    if base_config_path:
+        base_config = json.load(open(base_config_path))
+        unknown_keys = [key for key in base_config if key.isupper() and key not in DEFAULT_CONFIG]
+        if unknown_keys:
+            print(f"warning: ignoring unknown keys from {base_config_path}: {unknown_keys}", file=sys.stderr)
+        parser.set_defaults(**{key: val for key, val in base_config.items() if key in DEFAULT_CONFIG})
+        if "PRECISION" not in base_config:
+            parser.set_defaults(PRECISION="fp32")  # configs saved before PRECISION existed trained fp32 LoRA+proj
+    args = parser.parse_args(argv)
+    config = {key: getattr(args, key) for key in DEFAULT_CONFIG}
+    return args, config
+
+
+def get_git_info():
+    """Commit hash, whether tracked files have uncommitted changes, and the diff against HEAD."""
+    def git(*cmd):
+        return subprocess.run(["git", *cmd], capture_output=True, text=True).stdout
+    return {
+        "commit": git("rev-parse", "HEAD").strip(),
+        "dirty": bool(git("status", "--porcelain", "--untracked-files=no").strip()),
+        "diff": git("diff", "HEAD"),
+    }
+
+
+def create_run_dir(run_name):
+    """Create a fresh, never-reused directory runs/<YYYYmmdd-HHMMSS>_<run_name>[_N]."""
+    run_id = f"{time.strftime('%Y%m%d-%H%M%S')}_{run_name}"
+    run_dir, suffix = Path("runs", run_id), 1
+    while run_dir.exists():
+        suffix += 1
+        run_dir = Path("runs", f"{run_id}_{suffix}")
+    run_dir.mkdir(parents=True)
+    return run_dir
+
+
+class RunTracker:
+    """Per-run bookkeeping: metrics.jsonl (append-only time series) and summary.json (status + headline numbers)."""
+
+    def __init__(self, run_dir, **initial_summary):
+        self.run_dir = Path(run_dir)
+        summary_path = self.run_dir / "summary.json"
+        self.summary = json.load(open(summary_path)) if summary_path.exists() else {}
+        self.update(**initial_summary)
+
+    def log_metrics(self, kind, **values):
+        """Append one row, e.g. log_metrics("val", step=500, wer=0.12)."""
+        row = {"type": kind, "time": round(time.time(), 1), **values}
+        with open(self.run_dir / "metrics.jsonl", "a") as f:
+            f.write(json.dumps(row) + "\n")
+
+    def update(self, **values):
+        """Merge values into summary.json (atomic rewrite, so a crash never leaves it half-written)."""
+        self.summary.update(values)
+        tmp_path = self.run_dir / "summary.json.tmp"
+        tmp_path.write_text(json.dumps(self.summary, indent=2))
+        tmp_path.replace(self.run_dir / "summary.json")
 
 
 def seed_everything(seed):
@@ -85,6 +254,26 @@ def seed_everything(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def make_progress_bar(**tqdm_kwargs):
+    """
+    Create a tqdm progress bar. When stderr is not a terminal (e.g. `> train.log 2>&1`),
+    refresh rarely so the redirected log is not flooded with carriage-return updates.
+    """
+    is_interactive = sys.stderr.isatty()
+    return tqdm(
+        dynamic_ncols=True,
+        mininterval=0.5 if is_interactive else 60.0,
+        file=sys.stderr,
+        **tqdm_kwargs,
+    )
+
+
+def format_duration(seconds):
+    """Format a duration in seconds as H:MM:SS."""
+    seconds = int(max(0, seconds))
+    return f"{seconds // 3600}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
 
 
 # ---------------------------------------------------------------- data
@@ -159,10 +348,14 @@ def extract_log_mel_spectrogram(audio_filepath):
     """
     waveform, sample_rate = sf.read(audio_filepath, dtype="float32")
     assert sample_rate == SR, f"Expected sample rate {SR}, but got {sample_rate} for {audio_filepath}"
+    return log_mel_from_waveform(waveform)
 
+
+def log_mel_from_waveform(waveform):
+    """(num_samples,) float32 mono waveform at SR -> (num_frames, N_MELS) log mel-spectrogram."""
     # Short-Time Fourier Transform (STFT) -> Power Spectrogram
     stft_complex = torch.stft(
-        torch.from_numpy(waveform),
+        torch.from_numpy(np.ascontiguousarray(waveform, dtype=np.float32)),
         n_fft=N_FFT,
         hop_length=HOP,
         window=STFT_WINDOW,
@@ -176,15 +369,20 @@ def extract_log_mel_spectrogram(audio_filepath):
     return log_mel
 
 
+def mvn_cache_path():
+    """MVN stats depend on the split, sample size and every feature-extraction knob, so all of them are in the name."""
+    return Path(DATA, f"mvn_{TRAIN_SPLIT}_n{MVN_N}_sr{SR}_fft{N_FFT}_hop{HOP}_mel{N_MELS}.pt")
+
+
 def compute_or_load_mvn_stats(dataset_items):
     """
     Compute global Mean-Variance Normalization (MVN) statistics over a sample of train utterances.
-    Caches the resulting mean and std vectors in data/mvn_<split>_n<sample_size>.pt.
+    Caches the resulting mean and std vectors in mvn_cache_path().
 
     Returns:
-        dict: {"mean": torch.Tensor(80,), "std": torch.Tensor(80,)}
+        dict: {"mean": torch.Tensor(N_MELS,), "std": torch.Tensor(N_MELS,)}
     """
-    cache_filepath = Path(DATA, f"mvn_{TRAIN_SPLIT}_n{MVN_N}.pt")
+    cache_filepath = mvn_cache_path()
     if cache_filepath.exists():
         return torch.load(cache_filepath)
 
@@ -227,7 +425,7 @@ class SpeechDataset(torch.utils.data.Dataset):
             zero_padding = normalized_mel.new_zeros(padding_frames_needed, N_MELS)
             normalized_mel = torch.cat([normalized_mel, zero_padding], dim=0)
 
-        # 3. Stack consecutive STACK (8) frames across all 80 frequency bins -> (num_tokens, 8 * 80) = (num_tokens, 640)
+        # 3. Stack STACK consecutive frames across all N_MELS bins -> (num_tokens, STACK * N_MELS), e.g. 16 * 80 = 1280
         stacked_audio_features = normalized_mel.reshape(-1, STACK * N_MELS)
 
         # 4. Tokenize target transcript: append a leading space and trailing [EOS] token
@@ -237,7 +435,7 @@ class SpeechDataset(torch.utils.data.Dataset):
         )
 
         return {
-            "audio": stacked_audio_features,  # Shape: (num_audio_tokens, 640)
+            "audio": stacked_audio_features,  # Shape: (num_audio_tokens, STACK * N_MELS)
             "target": target_token_ids,       # List of token IDs
             "text": item["text"],
             "id": item["id"],
@@ -291,6 +489,21 @@ def create_dataloader(speech_dataset, batch_sampler):
 
 
 # ---------------------------------------------------------------- model
+def trainable_dtype():
+    """dtype of the trainable weights (LoRA + projector), their grads and the AdamW states."""
+    return DTYPE if PRECISION == "bf16" else torch.float32
+
+
+def compute_context():
+    """
+    Context for forward passes. In "amp" mode, autocast runs the fp32 LoRA/projector matmuls in DTYPE
+    (the weights and optimizer stay fp32); otherwise every op already runs in its weights' dtype.
+    """
+    if PRECISION == "amp" and DTYPE != torch.float32:
+        return torch.autocast(device_type=torch.device(DEVICE).type, dtype=DTYPE)
+    return contextlib.nullcontext()
+
+
 def build_multimodal_inputs(batch, model, audio_projector, tokenizer, prompt_token_ids, is_train):
     """
     Project stacked mel features into token embedding space, concatenate with text prompt/target,
@@ -322,8 +535,9 @@ def build_multimodal_inputs(batch, model, audio_projector, tokenizer, prompt_tok
     token_labels_list = []
 
     for item in batch:
-        # 1. Project stacked mel features (num_audio_tokens, 640) -> (num_audio_tokens, hidden_size)
-        projected_audio_embeds = audio_projector(item["audio"].to(DEVICE)).to(DTYPE)
+        # 1. Project stacked mel features (num_audio_tokens, STACK * N_MELS) -> (num_audio_tokens, hidden_size)
+        audio_features = item["audio"].to(DEVICE, audio_projector.weight.dtype)
+        projected_audio_embeds = audio_projector(audio_features).to(DTYPE)
 
         # 2. Embed prompt and (if training) target text
         text_token_ids = prompt_token_ids + (item["target"] if is_train else [])
@@ -380,25 +594,40 @@ def load_model_and_projector(saved_run_dir=None):
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=DTYPE).to(DEVICE)
     hidden_dimension = model.config.hidden_size
 
-    # Linear projector: projects stacked mel frames (8 * 80 = 640) -> hidden_dimension (fp32)
-    audio_projector = nn.Linear(STACK * N_MELS, hidden_dimension).to(DEVICE)
+    # Linear projector: projects stacked mel frames (STACK * N_MELS) -> hidden_dimension, in trainable_dtype()
+    audio_projector = nn.Linear(STACK * N_MELS, hidden_dimension).to(DEVICE, trainable_dtype())
+    # PEFT upcasts LoRA weights to fp32 by default; in "bf16" mode keep them in the base model's DTYPE
+    upcast_lora = trainable_dtype() == torch.float32
 
     if saved_run_dir is None:
         lora_configuration = LoraConfig(
             r=LORA_R,
             lora_alpha=LORA_ALPHA,
             lora_dropout=LORA_DROPOUT,
-            target_modules="all-linear",
+            target_modules=LORA_TARGETS if LORA_TARGETS == "all-linear" else LORA_TARGETS.split(","),
             task_type="CAUSAL_LM",
         )
-        model = get_peft_model(model, lora_configuration)
+        model = get_peft_model(model, lora_configuration, autocast_adapter_dtype=upcast_lora)
     else:
         lora_weights_path = os.path.join(saved_run_dir, "lora")
         projector_weights_path = os.path.join(saved_run_dir, "proj.pt")
-        model = PeftModel.from_pretrained(model, lora_weights_path)
-        audio_projector.load_state_dict(torch.load(projector_weights_path))
+        model = PeftModel.from_pretrained(model, lora_weights_path, autocast_adapter_dtype=upcast_lora)
+        audio_projector.load_state_dict(torch.load(projector_weights_path, map_location=DEVICE))
 
     return tokenizer, model, audio_projector
+
+
+def describe_lora_placement(model):
+    """One line saying where LoRA sits in the LLM: which module names, in how many of the decoder layers."""
+    layer_ids_by_name = {}
+    for name, module in model.named_modules():
+        if hasattr(module, "lora_A"):
+            layer = re.search(r"\.layers\.(\d+)\.", name)
+            layer_ids_by_name.setdefault(name.rsplit(".", 1)[-1], set()).add(int(layer.group(1)) if layer else -1)
+    n_layers = model.config.num_hidden_layers
+    parts = [f"{name} ({len(ids)}/{n_layers} layers)" for name, ids in sorted(layer_ids_by_name.items())]
+    return (f"lora on LLM ({LORA_TARGETS!r}, r{LORA_R} a{LORA_ALPHA} dropout {LORA_DROPOUT}): " + ", ".join(parts)
+            + " | LLM base weights frozen, audio projector fully trained")
 
 
 # ---------------------------------------------------------------- eval
@@ -412,7 +641,8 @@ def normalize_text_for_wer(text):
 
 
 @torch.no_grad()
-def evaluate_dataset(dataset_items, mvn_stats, tokenizer, model, audio_projector, output_hypotheses_path=None):
+def evaluate_dataset(dataset_items, mvn_stats, tokenizer, model, audio_projector, output_hypotheses_path=None,
+                     progress_desc="eval"):
     """
     Evaluate Word Error Rate (WER) and audio token throughput on a set of utterances using greedy decoding.
 
@@ -423,11 +653,14 @@ def evaluate_dataset(dataset_items, mvn_stats, tokenizer, model, audio_projector
         model (nn.Module): Language model.
         audio_projector (nn.Linear): Audio projector.
         output_hypotheses_path (str, optional): If specified, write {id, ref, hyp} JSONL to this file.
+        progress_desc (str): Label shown on the tqdm progress bar.
 
     Returns:
-        dict: Evaluation metrics containing 'wer', 'n_utt', 'audio_tokens_per_sec', and 'audio_tokens'.
+        dict: Evaluation metrics containing 'wer', 'sub', 'del', 'ins' (rates), 'n_utt', 'n_words',
+              'audio_tokens_per_sec', 'audio_tokens', 'eval_sec', 'rtfx' and 'examples' (a few ref/hyp pairs).
     """
     model.eval()
+    eval_start_time = time.time()
     prompt_token_ids = tokenizer(PROMPT, add_special_tokens=False).input_ids
     speech_dataset = SpeechDataset(dataset_items, mvn_stats, tokenizer)
 
@@ -443,25 +676,27 @@ def evaluate_dataset(dataset_items, mvn_stats, tokenizer, model, audio_projector
     output_rows = []
     total_audio_tokens = 0
 
+    progress_bar = make_progress_bar(total=len(dataset_items), desc=progress_desc, unit="utt", leave=False)
     for batch in create_dataloader(speech_dataset, evaluation_batches):
-        inputs_embeds, attention_mask, _ = build_multimodal_inputs(
-            batch,
-            model=model,
-            audio_projector=audio_projector,
-            tokenizer=tokenizer,
-            prompt_token_ids=prompt_token_ids,
-            is_train=False,
-        )
+        with compute_context():
+            inputs_embeds, attention_mask, _ = build_multimodal_inputs(
+                batch,
+                model=model,
+                audio_projector=audio_projector,
+                tokenizer=tokenizer,
+                prompt_token_ids=prompt_token_ids,
+                is_train=False,
+            )
 
-        generated_token_ids = model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            use_cache=True,
-        )
+            generated_token_ids = model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                use_cache=True,
+            )
 
         for item, gen_tokens in zip(batch, generated_token_ids):
             decoded_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
@@ -473,8 +708,14 @@ def evaluate_dataset(dataset_items, mvn_stats, tokenizer, model, audio_projector
             output_rows.append({"id": item["id"], "ref": normalized_ref, "hyp": normalized_hyp})
             total_audio_tokens += item["audio"].shape[0]
 
+        progress_bar.update(len(batch))
+    progress_bar.close()
+
     total_audio_seconds = sum(item["sec"] for item in dataset_items)
-    word_error_rate = jiwer.wer(reference_transcripts, hypothesis_transcripts)
+    word_alignment = jiwer.process_words(reference_transcripts, hypothesis_transcripts)
+    word_error_rate = word_alignment.wer
+    n_reference_words = word_alignment.hits + word_alignment.substitutions + word_alignment.deletions
+    eval_seconds = time.time() - eval_start_time
 
     if output_hypotheses_path:
         with open(output_hypotheses_path, "w") as f:
@@ -484,19 +725,36 @@ def evaluate_dataset(dataset_items, mvn_stats, tokenizer, model, audio_projector
     model.train()
     return {
         "wer": word_error_rate,
+        "sub": word_alignment.substitutions / max(1, n_reference_words),
+        "del": word_alignment.deletions / max(1, n_reference_words),
+        "ins": word_alignment.insertions / max(1, n_reference_words),
         "n_utt": len(dataset_items),
+        "n_words": n_reference_words,
         "audio_tokens_per_sec": total_audio_tokens / total_audio_seconds,
         "audio_tokens": total_audio_tokens,
+        "eval_sec": eval_seconds,
+        "rtfx": total_audio_seconds / eval_seconds,  # seconds of audio decoded per wall-clock second
+        "examples": random.Random(SEED).sample(output_rows, min(LOG_N_EXAMPLES, len(output_rows))),
     }
 
 
-def run_test_evaluation(run_dir, mvn_stats, tokenizer, model, audio_projector):
+def format_eval_metrics(metrics):
+    """One-line human-readable summary of evaluate_dataset() output."""
+    return (
+        f"WER {metrics['wer'] * 100:.2f} (sub {metrics['sub'] * 100:.2f} del {metrics['del'] * 100:.2f} "
+        f"ins {metrics['ins'] * 100:.2f}) | {metrics['n_utt']} utts {metrics['n_words']} words | "
+        f"{metrics['eval_sec']:.0f}s RTFx {metrics['rtfx']:.0f} | audio tok/s {metrics['audio_tokens_per_sec']:.2f}"
+    )
+
+
+def run_test_evaluation(run_dir, mvn_stats, tokenizer, model, audio_projector, log_fn=None):
     """
     Run evaluation across all configured test splits (e.g. test-clean, test-other) and save results.
+    log_fn (callable, optional) receives one summary line per split; defaults to tqdm.write.
     """
+    log_fn = log_fn or (lambda message: tqdm.write(message, file=sys.stdout))
     test_results = {}
     for split_name in TEST_SPLITS:
-        start_time = time.time()
         hypotheses_filepath = os.path.join(run_dir, f"hyp_{split_name}.jsonl")
         split_items = load_librispeech_split(split_name)
         test_results[split_name] = evaluate_dataset(
@@ -506,9 +764,11 @@ def run_test_evaluation(run_dir, mvn_stats, tokenizer, model, audio_projector):
             model=model,
             audio_projector=audio_projector,
             output_hypotheses_path=hypotheses_filepath,
+            progress_desc=f"test {split_name}",
         )
-        test_results[split_name]["eval_sec"] = time.time() - start_time
-        print(split_name, test_results[split_name], flush=True)
+        test_results[split_name].pop("examples")
+        tqdm_message = f"[test] {split_name} {format_eval_metrics(test_results[split_name])}"
+        log_fn(tqdm_message)
 
     json.dump(test_results, open(os.path.join(run_dir, "test_results.json"), "w"), indent=2)
     return test_results
@@ -516,37 +776,118 @@ def run_test_evaluation(run_dir, mvn_stats, tokenizer, model, audio_projector):
 
 # ---------------------------------------------------------------- train
 def main():
-    arg_parser = argparse.ArgumentParser(description="Train or evaluate encoder-free Mel-to-LLM ASR model.")
-    arg_parser.add_argument("--max_steps", type=int, default=None, help="Cap optimizer steps (for smoke tests)")
-    arg_parser.add_argument("--eval_only", type=str, default=None, help="Run directory to evaluate without training")
-    args = arg_parser.parse_args()
-
+    args, config = parse_args()
+    apply_config(config)
     seed_everything(SEED)
 
-    # Fast path: evaluation only mode from existing checkpoint
+    # Fast path: evaluation only mode from existing checkpoint (config comes from its config.json + any flags)
     if args.eval_only:
         tokenizer, model, audio_projector = load_model_and_projector(args.eval_only)
-        mvn_stats = torch.load(Path(DATA, f"mvn_{TRAIN_SPLIT}_n{MVN_N}.pt"))
-        run_test_evaluation(args.eval_only, mvn_stats, tokenizer, model, audio_projector)
+        mvn_stats = torch.load(mvn_cache_path())
+        test_results = run_test_evaluation(args.eval_only, mvn_stats, tokenizer, model, audio_projector)
+        RunTracker(args.eval_only).update(
+            test_wer={split_name: round(metrics["wer"] * 100, 2) for split_name, metrics in test_results.items()}
+        )
         return
 
-    # Set up run output directory and logging
-    run_directory_name = RUN_NAME + (f"_smoke{args.max_steps}" if args.max_steps else "")
-    run_dir = os.path.join("runs", run_directory_name)
-    os.makedirs(run_dir, exist_ok=True)
+    # Set up a fresh run directory: config + git state are written before anything can fail
+    run_name = RUN_NAME or f"{MODEL.split('/')[-1]}_stack{STACK}{override_name_suffix(config)}"
+    run_dir = create_run_dir(run_name + (f"_smoke{args.max_steps}" if args.max_steps else ""))
+    run_id = run_dir.name
+    runs_lib.update_latest_link(run_dir)
+    git_info = get_git_info()
+    started_at = time.strftime("%Y-%m-%d %H:%M:%S")
 
     config = get_config_dictionary()
-    config["git"] = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-    config["max_steps"] = args.max_steps
-    json.dump(config, open(os.path.join(run_dir, "config.json"), "w"), indent=2)
+    config["meta"] = {
+        "run_id": run_id,
+        "command": shlex.join([sys.executable.split("/")[-1], *sys.argv]),
+        "notes": args.notes,
+        "base_config": args.config,
+        "overrides": {key: val for key, val in config.items() if val != DEFAULT_CONFIG[key]},
+        "max_steps": args.max_steps,
+        "started_at": started_at,
+        "host": socket.gethostname(),
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "torch": torch.__version__,
+        "git_commit": git_info["commit"],
+        "git_dirty": git_info["dirty"],
+    }
+    json.dump(config, open(run_dir / "config.json", "w"), indent=2)
+    if git_info["diff"]:
+        (run_dir / "git_diff.patch").write_text(git_info["diff"])
 
-    log_file = open(os.path.join(run_dir, "log.txt"), "a")
+    tracker = RunTracker(run_dir, run_id=run_id, status="running", started_at=started_at, notes=args.notes)
+    log_file = open(run_dir / "log.txt", "a")
+    runs_lib.write_index()
 
     def log_and_print(*print_args):
         message = " ".join(str(arg) for arg in print_args)
-        print(message, flush=True)
+        tqdm.write(message, file=sys.stdout)  # prints above any active progress bar
+        sys.stdout.flush()
         log_file.write(message + "\n")
         log_file.flush()
+
+    dirty_marker = " (dirty, see git_diff.patch)" if git_info["dirty"] else ""
+    log_and_print(f"===== run {run_id} | {started_at} | git {git_info['commit'][:10]}{dirty_marker} =====")
+    log_and_print(f"command: {config['meta']['command']}")
+    if args.notes:
+        log_and_print(f"notes: {args.notes}")
+    log_and_print(f"overrides vs defaults: {json.dumps(config['meta']['overrides'])}")
+
+    run_start_time = time.time()
+    try:
+        trained = train(args, run_dir, tracker, log_and_print)
+    except BaseException as error:
+        status = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+        tracker.update(status=status, error=repr(error), finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                       duration_sec=round(time.time() - run_start_time))
+        log_and_print(f"run {status}: {error!r}")
+        runs_lib.refresh_run_views(run_dir, log_and_print)
+        raise
+    tracker.update(status="done", finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                   duration_sec=round(time.time() - run_start_time))
+    runs_lib.refresh_run_views(run_dir, log_and_print)
+
+    # Open ASR benchmark with the model still in memory. The run is already "done": a benchmark error is recorded
+    # in summary.json (rerun with `python benchmark.py mel:runs/<id> --sets ...`), it does not fail the run.
+    if BENCHMARK_SETS.lower() != "none" and not args.max_steps:
+        import benchmark as benchmark_lib
+        sets = benchmark_lib.resolve_sets(BENCHMARK_SETS)
+        log_and_print(f"benchmark: {','.join(sets)} -> results/mel_{run_id}/")
+        try:
+            bench_model = benchmark_lib.MelLLM(run_dir, EVAL_BATCH_SIZE, loaded=trained)
+            bench_summary = benchmark_lib.benchmark(bench_model, f"mel_{run_id}", sets, log=log_and_print)
+            log_and_print("BENCHMARK", json.dumps({s: bench_summary[s]["wer"] for s in sets}))
+        except Exception as error:  # noqa: BLE001
+            log_and_print(f"benchmark failed: {error!r}")
+            benchmark_lib.update_run_summary(run_dir, benchmark_status="failed", benchmark_error=repr(error))
+        runs_lib.refresh_run_views(run_dir, log_and_print)
+    log_file.close()
+
+
+def override_name_suffix(config):
+    """
+    Short run-name suffix from the hyperparameters that differ from the defaults, so runs/ is readable at a glance:
+    --epochs 10 --batch_size 20 -> "_epochs10_bs20". MODEL/STACK are already in the name; bookkeeping keys are skipped.
+    """
+    short = {"BATCH_SIZE": "bs", "GRAD_ACCUM": "ga", "LORA_R": "r", "LORA_ALPHA": "a", "LORA_DROPOUT": "ldrop",
+             "LORA_TARGETS": "lora", "WARMUP_STEPS": "warmup", "WEIGHT_DECAY": "wd", "GRAD_CLIP": "clip",
+             "TRAIN_SPLIT": "train", "PRECISION": "prec", "MAX_TRAIN_SEC": "maxsec"}
+    skip = runs_lib.IGNORED_KEYS | {"MODEL", "STACK", "EVAL_EVERY", "VAL_N", "TEST_SPLITS", "DATA", "MAX_NEW_TOKENS"}
+    parts = []
+    for key, val in config.items():
+        if key in skip or key not in DEFAULT_CONFIG or val == DEFAULT_CONFIG[key]:
+            continue
+        val = runs_lib.fmt(val).replace("_proj", "").replace(",", "+")
+        parts.append(short.get(key, key.lower().replace("_", "")) + re.sub(r"[^A-Za-z0-9.+-]", "", val))
+    suffix = "_".join(parts)[:60]
+    return f"_{suffix}" if suffix else ""
+
+
+def train(args, run_dir, tracker, log_and_print):
+    """Full training loop + final test eval. Writes metrics to tracker and checkpoints to run_dir."""
+    log_and_print(f"model {MODEL} | device {torch.cuda.get_device_name(0)} | dtype {DTYPE} | precision {PRECISION}")
 
     # Load dataset splits
     train_items = [item for item in load_librispeech_split(TRAIN_SPLIT) if item["sec"] <= MAX_TRAIN_SEC]
@@ -555,6 +896,10 @@ def main():
 
     total_train_hours = sum(item["sec"] for item in train_items) / 3600.0
     log_and_print(f"train utts {len(train_items)} ({total_train_hours:.1f} h), val utts {len(validation_items)}")
+    log_and_print(
+        f"batch {BATCH_SIZE} x accum {GRAD_ACCUM} = {BATCH_SIZE * GRAD_ACCUM} | lr {LR:.1e} warmup {WARMUP_STEPS} "
+        f"| epochs {EPOCHS} | stack {STACK} ({SR / HOP / STACK:.2f} Hz audio tokens, {STACK * N_MELS}-d patches) | lora r{LORA_R} a{LORA_ALPHA} on LLM {LORA_TARGETS}"
+    )
 
     # Initialize model and linear projector
     tokenizer, model, audio_projector = load_model_and_projector()
@@ -568,7 +913,9 @@ def main():
 
     lora_param_count_m = sum(param.numel() for param in trainable_lora_params) / 1e6
     proj_param_count_m = sum(param.numel() for param in audio_projector.parameters()) / 1e6
-    log_and_print(f"trainable: lora {lora_param_count_m:.1f}M, proj {proj_param_count_m:.2f}M")
+    log_and_print(f"trainable: lora {lora_param_count_m:.1f}M, proj {proj_param_count_m:.2f}M "
+                  f"({sorted({str(p.dtype).removeprefix('torch.') for p in all_trainable_params})})")
+    log_and_print(describe_lora_placement(model))
 
     optimizer = torch.optim.AdamW(all_trainable_params, lr=LR, weight_decay=WEIGHT_DECAY, betas=(0.9, 0.999))
 
@@ -590,54 +937,114 @@ def main():
 
     optimizer_step = 0
     micro_step = 0
-    step_start_time = time.time()
-    running_loss = 0.0
-    running_tokens = 0
+    train_start_time = time.time()
+    best_val_wer, best_val_step = float("inf"), None
+
+    # Per-logging-window accumulators (reset every LOG_EVERY optimizer steps)
+    def reset_window_stats():
+        return {
+            "start_time": time.time(), "loss_sum": 0.0, "micro_steps": 0, "tokens": 0, "padded_tokens": 0,
+            "target_tokens": 0, "utts": 0, "audio_sec": 0.0, "data_wait_sec": 0.0, "grad_norms": [],
+        }
+
+    window = reset_window_stats()
+    step_loss_sum = 0.0  # loss summed over the micro-batches of the current optimizer step (for the bar)
+
+    progress_bar = make_progress_bar(total=total_optimizer_steps, desc="train", unit="step")
 
     for epoch in range(EPOCHS):
         epoch_sampler = create_length_batched_sampler(train_items, BATCH_SIZE, seed=SEED + epoch)
         dataloader = create_dataloader(train_dataset, epoch_sampler)
+        progress_bar.set_description(f"train ep {epoch + 1}/{EPOCHS}")
 
+        data_wait_start = time.time()
         for batch in dataloader:
-            inputs_embeds, attention_mask, target_labels = build_multimodal_inputs(
-                batch,
-                model=model,
-                audio_projector=audio_projector,
-                tokenizer=tokenizer,
-                prompt_token_ids=prompt_token_ids,
-                is_train=True,
-            )
+            window["data_wait_sec"] += time.time() - data_wait_start
 
-            outputs = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=target_labels)
+            with compute_context():
+                inputs_embeds, attention_mask, target_labels = build_multimodal_inputs(
+                    batch,
+                    model=model,
+                    audio_projector=audio_projector,
+                    tokenizer=tokenizer,
+                    prompt_token_ids=prompt_token_ids,
+                    is_train=True,
+                )
+                outputs = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=target_labels)
             loss = outputs.loss
             (loss / GRAD_ACCUM).backward()
 
-            running_loss += loss.item()
-            running_tokens += int(attention_mask.sum())
+            loss_value = loss.item()
+            step_loss_sum += loss_value
+            window["loss_sum"] += loss_value
+            window["micro_steps"] += 1
+            window["tokens"] += int(attention_mask.sum())
+            window["padded_tokens"] += attention_mask.numel()
+            window["target_tokens"] += int((target_labels != -100).sum())
+            window["utts"] += len(batch)
+            window["audio_sec"] += sum(item["audio"].shape[0] for item in batch) * STACK * HOP / SR
             micro_step += 1
 
             if micro_step % GRAD_ACCUM != 0:
+                data_wait_start = time.time()
                 continue
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(all_trainable_params, GRAD_CLIP)
+            grad_norm = torch.nn.utils.clip_grad_norm_(all_trainable_params, GRAD_CLIP).item()
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             optimizer_step += 1
+            window["grad_norms"].append(grad_norm)
+
+            current_lr = lr_scheduler.get_last_lr()[0]
+            progress_bar.update(1)
+            progress_bar.set_postfix(
+                loss=f"{step_loss_sum / GRAD_ACCUM:.3f}",
+                gnorm=f"{grad_norm:.2f}",
+                lr=f"{current_lr:.1e}",
+                best_wer="-" if best_val_step is None else f"{best_val_wer * 100:.2f}",
+                refresh=False,
+            )
+            step_loss_sum = 0.0
 
             if optimizer_step % LOG_EVERY == 0:
-                elapsed_time = time.time() - step_start_time
-                average_loss = running_loss / (LOG_EVERY * GRAD_ACCUM)
-                tokens_per_sec = running_tokens / elapsed_time
-                current_lr = lr_scheduler.get_last_lr()[0]
-                peak_vram_gb = torch.cuda.max_memory_allocated() / (2**30)
+                elapsed_time = time.time() - window["start_time"]
+                average_loss = window["loss_sum"] / window["micro_steps"]
+                grad_norms = window["grad_norms"]
+                total_elapsed = time.time() - train_start_time
+                eta_seconds = total_elapsed / optimizer_step * (total_optimizer_steps - optimizer_step)
+                epoch_progress = micro_step / len(epoch_sampler)  # fractional epochs completed (all epochs)
+                num_clipped = sum(norm > GRAD_CLIP for norm in grad_norms)
 
                 log_and_print(
-                    f"ep {epoch} step {optimizer_step}/{total_optimizer_steps} loss {average_loss:.4f} "
-                    f"gnorm {grad_norm:.2f} lr {current_lr:.2e} tok/s {tokens_per_sec:.0f} "
-                    f"mem {peak_vram_gb:.1f}G"
+                    f"ep {epoch_progress:.2f} step {optimizer_step}/{total_optimizer_steps} "
+                    f"({optimizer_step / total_optimizer_steps * 100:.1f}%) | "
+                    f"loss {average_loss:.4f} ppl {math.exp(min(average_loss, 20)):.2f} | "
+                    f"gnorm {grad_norm:.2f} (avg {np.mean(grad_norms):.2f} max {np.max(grad_norms):.2f} "
+                    f"clipped {num_clipped}/{len(grad_norms)}) | lr {current_lr:.2e} | "
+                    f"elapsed {format_duration(total_elapsed)} eta {format_duration(eta_seconds)}"
                 )
-                step_start_time, running_loss, running_tokens = time.time(), 0.0, 0
+                log_and_print(
+                    f"    perf: {elapsed_time / len(grad_norms):.2f}s/step tok/s {window['tokens'] / elapsed_time:.0f} "
+                    f"tgt tok/s {window['target_tokens'] / elapsed_time:.0f} utt/s {window['utts'] / elapsed_time:.1f} "
+                    f"audio {window['audio_sec'] / elapsed_time:.0f}x realtime | "
+                    f"pad eff {window['tokens'] / max(1, window['padded_tokens']) * 100:.0f}% "
+                    f"data wait {window['data_wait_sec'] / elapsed_time * 100:.0f}% | "
+                    f"mem {torch.cuda.memory_allocated() / 2**30:.1f}G "
+                    f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f}G "
+                    f"reserved {torch.cuda.memory_reserved() / 2**30:.1f}G"
+                )
+                tracker.log_metrics(
+                    "train", step=optimizer_step, epoch=round(epoch_progress, 4), loss=average_loss,
+                    lr=current_lr, grad_norm=grad_norm, grad_norm_avg=float(np.mean(grad_norms)),
+                    grad_norm_max=float(np.max(grad_norms)), clipped=num_clipped,
+                    sec_per_step=elapsed_time / len(grad_norms), tok_per_sec=window["tokens"] / elapsed_time,
+                    peak_mem_gb=torch.cuda.max_memory_allocated() / 2**30, elapsed_sec=total_elapsed,
+                )
+                tracker.update(step=optimizer_step, total_steps=total_optimizer_steps, train_loss=average_loss)
+                window = reset_window_stats()
+                if optimizer_step % PLOT_EVERY == 0:
+                    runs_lib.refresh_run_views(run_dir, log_and_print)
 
             if optimizer_step % EVAL_EVERY == 0 or optimizer_step == total_optimizer_steps:
                 val_metrics = evaluate_dataset(
@@ -646,15 +1053,43 @@ def main():
                     tokenizer=tokenizer,
                     model=model,
                     audio_projector=audio_projector,
+                    progress_desc=f"val @{optimizer_step}",
                 )
-                log_and_print(f"[val] step {optimizer_step} {VAL_SPLIT}[:{VAL_N}] WER {val_metrics['wer'] * 100:.2f}")
-                step_start_time = time.time()
+                is_best = val_metrics["wer"] < best_val_wer
+                if is_best:
+                    best_val_wer, best_val_step = val_metrics["wer"], optimizer_step
+                log_and_print(
+                    f"[val] step {optimizer_step} {VAL_SPLIT}[:{VAL_N}] {format_eval_metrics(val_metrics)} | "
+                    f"best {best_val_wer * 100:.2f} @ step {best_val_step}{' (new best)' if is_best else ''}"
+                )
+                for example in val_metrics["examples"]:
+                    log_and_print(f"    [{example['id']}] REF: {example['ref']}")
+                    log_and_print(f"    [{example['id']}] HYP: {example['hyp']}")
+                tracker.log_metrics(
+                    "val", step=optimizer_step,
+                    **{key: val for key, val in val_metrics.items() if key != "examples"},
+                )
+                tracker.update(
+                    step=optimizer_step, total_steps=total_optimizer_steps,
+                    val_wer=round(val_metrics["wer"] * 100, 2),
+                    best_val_wer=round(best_val_wer * 100, 2), best_val_step=best_val_step,
+                )
+                runs_lib.refresh_run_views(run_dir, log_and_print)
+                window = reset_window_stats()  # exclude eval time from training throughput
 
             if optimizer_step >= total_optimizer_steps:
                 break
 
+            data_wait_start = time.time()
+
         if optimizer_step >= total_optimizer_steps:
             break
+
+    progress_bar.close()
+    log_and_print(
+        f"training done: {optimizer_step} steps in {format_duration(time.time() - train_start_time)}, "
+        f"best val WER {best_val_wer * 100:.2f} @ step {best_val_step}"
+    )
 
     # Save trained LoRA adapter and linear projector
     model.save_pretrained(os.path.join(run_dir, "lora"))
@@ -662,11 +1097,15 @@ def main():
     log_and_print("saved", run_dir)
 
     if args.max_steps:
-        return  # Smoke test run: skip full evaluation on test splits
+        return tokenizer, model, audio_projector  # Smoke test run: skip full evaluation on test splits
 
-    test_results = run_test_evaluation(run_dir, mvn_stats, tokenizer, model, audio_projector)
+    test_results = run_test_evaluation(run_dir, mvn_stats, tokenizer, model, audio_projector, log_fn=log_and_print)
     wer_summary = {split_name: round(metrics["wer"] * 100, 2) for split_name, metrics in test_results.items()}
+    for split_name, metrics in test_results.items():
+        tracker.log_metrics("test", step=optimizer_step, split=split_name, **metrics)
+    tracker.update(test_wer=wer_summary)
     log_and_print("TEST", json.dumps(wer_summary))
+    return tokenizer, model, audio_projector
 
 
 if __name__ == "__main__":
