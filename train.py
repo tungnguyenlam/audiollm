@@ -35,6 +35,7 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 import jiwer
@@ -42,6 +43,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -53,11 +55,18 @@ RUN_NAME = ""                # run directory suffix; empty = auto "<model>_stack
 SEED = 0                     # Random seed for reproducibility
 MODEL = "LiquidAI/LFM2.5-230M-Base"  # small model for fast experiments (2.6B-Base is the paper-scale target)
 DATA = "data/LibriSpeech"    # Path to dataset directory
-TRAIN_SPLIT = "train-clean-100"  # Training dataset split
+ASR_CORPORA = "data/asr_corpora"  # unpacked non-LibriSpeech corpora (unpack_parquet_asr_corpora.py), addressed as "<corpus>/<split>"
+TRAIN_SPLIT = "train-clean-100+train-clean-360+ami_ihm/train+fleurs_en/train"  # Training split(s), "+"-joined: LibriSpeech names or "<corpus>/<split>" (100+360 h read speech, ~80 h AMI meetings, ~7 h FLEURS); "train-clean-100" = pre-2026-10-27 runs. "<split>*K" repeats a split K times per epoch (fractional K adds a seeded random subset), e.g. "fleurs_en/train*6"
+MVN_SPLIT = ""               # split spec whose cached MVN stats normalise the mel features; "" = TRAIN_SPLIT without "*K" weights (INIT_FROM runs inherit the init run's)
+INIT_FROM = ""               # run dir to initialise LoRA + projector weights from (fresh optimizer, warmup and schedule), e.g. runs/20261027-150147_mix544h_conv_stack8; "" = fresh init
+MIN_TRAIN_SEC = 1.0          # drop shorter train utts (mostly AMI back-channels like "yeah", "mm-hmm")
 VAL_SPLIT = "dev-clean"      # Validation dataset split
 VAL_N = 200                  # fixed dev subset used for in-training WER
 TEST_SPLITS = ["test-clean", "test-other"]  # Test dataset splits
 MAX_TRAIN_SEC = 30.0         # drop the few very long utterances
+TRAIN_N = 0                  # 0 = all train utts; N > 0 = a fixed random subset of N (seeded), e.g. 10 for an overfit test
+VAL_FROM_TRAIN = False       # validate on the training utterances themselves (first VAL_N of the train set) instead of VAL_SPLIT: overfit / memorisation test
+EVAL_AUDIO_ABLATIONS = ""    # comma list of extra decodes per val pass to test audio dependence: "shuffle" (each utt gets its batch neighbour's audio), "zeros" (all-zero mel); logged as wer_<ablation>
 
 # Audio feature extraction configuration
 SR = 16000                   # Target audio sample rate (Hz)
@@ -77,10 +86,15 @@ LR = 1e-4                    # Peak learning rate: 1e-4, reached after linear wa
 LR_SCHEDULE = "cosine"       # Decay after warmup: "cosine" (half-cosine annealing to MIN_LR_RATIO * LR) | "linear" (to 0, pre-2026-10-27 runs)
 MIN_LR_RATIO = 0.0           # Cosine floor as a fraction of LR (e.g. 0.1 -> anneal to 1e-5)
 WEIGHT_DECAY = 0.0           # Weight decay for optimizer
+PROJECTOR = "linear"         # audio adapter: "linear" (nn.Linear(STACK*N_MELS -> d)) | "mlp" (LayerNorm + 2-layer GELU MLP on stacked patches) | "conv" (Mel-LLM style strided Conv1d x log2(STACK) on continuous mel + LayerNorm + 2-layer GELU MLP)
+PROJ_INIT = "match_emb"      # projector output init: "match_emb" (N(0, emb_std/sqrt(fan_in)), zero bias -> audio embeddings ~ the LLM's text-embedding scale) | "default" (PyTorch nn.Linear init, ~20x larger than text embeddings; pre-2026-10-27 runs)
+PROJ_LR_MULT = 1.0           # projector lr = LR * PROJ_LR_MULT (LoRA uses LR)
+PROJ_ONLY_STEPS = 0          # optimizer steps with LoRA frozen (only the projector trains) before LoRA joins with its own WARMUP_STEPS warmup
 OPTIMIZER = "adamw"          # "adamw" (all trainable params) | "muon" (torch.optim.Muon on every trainable 2D linear weight = LoRA A/B + projector weight; no AdamW anywhere, so the projector bias is frozen at init; the LLM's depthwise conv is frozen either way)
 MUON_ADJUST_LR = "match_rms_adamw"  # Muon per-matrix lr scaling: "match_rms_adamw" (update RMS ~ AdamW's, so LR/WEIGHT_DECAY transfer from AdamW) | "original" (Keller Jordan's sqrt(max(1, A/B)); wants LR ~ 0.02)
 WARMUP_STEPS = 200           # Linear learning rate warmup steps
 EPOCHS = 2                   # Total number of training epochs
+TRAIN_STEPS = 0              # >0: train exactly this many optimizer steps (LR schedule spans them; epochs repeat as needed) instead of EPOCHS, e.g. to match budgets across data mixes
 BATCH_SIZE = 8               # Training batch size per device
 GRAD_ACCUM = 4               # Gradient accumulation steps -> effective batch size = 8 * 4 = 32
 GRAD_CLIP = 1.0              # Maximum gradient norm clipping threshold
@@ -88,11 +102,14 @@ GRAD_CKPT = True             # Enable gradient checkpointing to reduce VRAM
 LOG_EVERY = 20               # Step interval for logging training progress
 EVAL_EVERY = 500             # Evaluate on validation split every N optimizer steps
 EVAL_BATCH_SIZE = 16         # Evaluation batch size
-MAX_NEW_TOKENS = 200         # Maximum generated tokens during evaluation
+MAX_NEW_TOKENS = 256         # Hard cap on generated tokens during evaluation (pre-2026-10-27 runs: 200)
+MAX_TOKENS_PER_SEC = 6.0     # Per-utterance decode cap: ceil(MAX_TOKENS_PER_SEC * sec) + MAX_TOKENS_PAD tokens (0 = only MAX_NEW_TOKENS); no train transcript exceeds 6*sec+10
+MAX_TOKENS_PAD = 10          # Constant slack added to the per-utterance cap
+NO_REPEAT_NGRAM_SIZE = 0     # >0: forbid repeating any n-gram of this size in a hypothesis (HF generate); 0 = off
 NUM_WORKERS = 8              # Number of DataLoader worker processes
 LOG_N_EXAMPLES = 2           # Number of (ref, hyp) examples printed after each validation pass
 PLOT_EVERY = 100             # Re-draw runs/<id>/plots.png (+ runs/INDEX.md) every N optimizer steps and after each val
-BENCHMARK_SETS = "all"       # After training + test eval, run benchmark.py on these Open ASR sets with the in-memory model: "all", comma list (e.g. "librispeech_clean,ami") or "none"
+BENCHMARK_SETS = "all"       # After training + test eval, run benchmark.py with the in-memory model: "all" (7 Open ASR sets + local fleurs_en/edacc test sets), "openasr", comma list (e.g. "librispeech_clean,ami") or "none"
 
 DEVICE = "cuda"              # Compute device (cuda or cpu)
 DTYPE = torch.bfloat16       # Base model torch dtype
@@ -102,6 +119,7 @@ PRECISION = "bf16"           # bf16: LoRA+proj weights/grads/AdamW states in DTY
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 PRECISIONS = ("bf16", "amp", "fp32")  # tuple, so it is not picked up as a config constant
 OPTIMIZERS = ("adamw", "muon")
+PROJECTORS = ("linear", "mlp", "conv")
 
 
 def get_config_dictionary():
@@ -178,13 +196,15 @@ def build_arg_parser():
         if isinstance(default, bool):
             kwargs["action"] = argparse.BooleanOptionalAction
         elif isinstance(default, list):
-            kwargs.update(nargs="+", type=type(default[0]) if default else str)
+            kwargs.update(nargs="*", type=type(default[0]) if default else str)  # "*": a bare `--test_splits` = none
         elif key == "DTYPE":
             kwargs["choices"] = list(DTYPES)
         elif key == "PRECISION":
             kwargs["choices"] = PRECISIONS
         elif key == "OPTIMIZER":
             kwargs["choices"] = OPTIMIZERS
+        elif key == "PROJECTOR":
+            kwargs["choices"] = PROJECTORS
         else:
             kwargs["type"] = type(default)
         hparam_group.add_argument("--" + key.lower(), **kwargs)
@@ -210,6 +230,12 @@ def parse_args(argv=None):
         parser.set_defaults(**{key: val for key, val in base_config.items() if key in DEFAULT_CONFIG})
         if "PRECISION" not in base_config:
             parser.set_defaults(PRECISION="fp32")  # configs saved before PRECISION existed trained fp32 LoRA+proj
+        if "PROJ_INIT" not in base_config:
+            parser.set_defaults(PROJ_INIT="default")  # configs saved before PROJ_INIT existed used PyTorch's init
+        if "MIN_TRAIN_SEC" not in base_config:
+            parser.set_defaults(MIN_TRAIN_SEC=0.0)  # no minimum length before MIN_TRAIN_SEC existed
+        if "PROJECTOR" not in base_config:
+            parser.set_defaults(PROJECTOR="linear")
     args = parser.parse_args(argv)
     config = {key: getattr(args, key) for key in DEFAULT_CONFIG}
     return args, config
@@ -300,8 +326,13 @@ def load_librispeech_split(split_name):
             - 'text': ground-truth transcript (lowercased)
             - 'sec': audio duration in seconds
     """
+    split_dir = Path(DATA, split_name)
+    manifest_path = split_dir / "manifest.jsonl"
+    if manifest_path.exists():
+        return [json.loads(line) for line in manifest_path.read_text().splitlines()]
+
     utterance_records = []
-    for transcript_file in sorted(Path(DATA, split_name).rglob("*.trans.txt")):
+    for transcript_file in sorted(split_dir.rglob("*.trans.txt")):
         for line in transcript_file.read_text().splitlines():
             utterance_id, text = line.split(" ", 1)
             audio_path = transcript_file.parent / f"{utterance_id}.flac"
@@ -311,7 +342,49 @@ def load_librispeech_split(split_name):
                 "text": text.lower(),
                 "sec": sf.info(str(audio_path)).duration,
             })
+    if utterance_records and (split_dir / ".done").exists():
+        manifest_path.write_text("".join(json.dumps(r) + "\n" for r in utterance_records))
     return utterance_records
+
+
+def normalize_training_text(text):
+    """Training target / reference text: strip annotation tags, lowercase ASCII, keep letters/digits/apostrophes."""
+    if text.strip() == "IGNORE_TIME_SEGMENT_IN_SCORING":
+        return ""
+    text = re.sub(r"<[^>]+>|\[[^\]]+\]", " ", text)
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9' ]", " ", text)).strip()
+
+
+def load_split(split_spec):
+    """
+    Utterances for a split spec: a LibriSpeech split name ("train-clean-100"), an unpacked corpus split
+    ("ami_ihm/train", see unpack_parquet_asr_corpora.py), or several of them joined with "+". A "*K" suffix
+    ("fleurs_en/train*6") repeats that split's utterances K times; a fractional K adds a SEED-fixed random subset.
+    Returns the same dicts as load_librispeech_split(), with text normalised by normalize_training_text().
+    """
+    records = []
+    for part in split_spec.split("+"):
+        name, _, weight_text = part.partition("*")
+        weight = float(weight_text) if weight_text else 1.0
+        if "/" in name:
+            manifest = Path(ASR_CORPORA, name, "manifest.jsonl")
+            split_records = [json.loads(line) for line in manifest.read_text().splitlines()]
+        else:
+            split_records = load_librispeech_split(name)
+        for record in split_records:
+            record["text"] = normalize_training_text(record["text"])
+        split_records = [record for record in split_records if record["text"]]
+        repeats, fraction = int(weight), weight - int(weight)
+        records += split_records * repeats
+        if fraction > 0:
+            records += random.Random(SEED).sample(split_records, round(fraction * len(split_records)))
+    return records
+
+
+def unweighted_split(split_spec):
+    """Split spec without "*K" weights: "a*2+b" -> "a+b"."""
+    return re.sub(r"\*[0-9.]+", "", split_spec)
 
 
 def build_htk_mel_filterbank():
@@ -381,15 +454,21 @@ def log_mel_from_waveform(waveform):
     return log_mel
 
 
+def mvn_split():
+    """Split spec whose MVN stats are used: MVN_SPLIT, else TRAIN_SPLIT without "*K" weights."""
+    return MVN_SPLIT or unweighted_split(TRAIN_SPLIT)
+
+
 def mvn_cache_path():
     """MVN stats depend on the split, sample size and every feature-extraction knob, so all of them are in the name."""
-    return Path(DATA, f"mvn_{TRAIN_SPLIT}_n{MVN_N}_sr{SR}_fft{N_FFT}_hop{HOP}_mel{N_MELS}.pt")
+    return Path(DATA, f"mvn_{mvn_split().replace('/', '-')}_n{MVN_N}_sr{SR}_fft{N_FFT}_hop{HOP}_mel{N_MELS}.pt")
 
 
 def compute_or_load_mvn_stats(dataset_items):
     """
     Compute global Mean-Variance Normalization (MVN) statistics over a sample of train utterances.
-    Caches the resulting mean and std vectors in mvn_cache_path().
+    Caches the resulting mean and std vectors in mvn_cache_path(). dataset_items is only used when mvn_split() is
+    the (unweighted) TRAIN_SPLIT; otherwise the MVN split is loaded.
 
     Returns:
         dict: {"mean": torch.Tensor(N_MELS,), "std": torch.Tensor(N_MELS,)}
@@ -397,6 +476,8 @@ def compute_or_load_mvn_stats(dataset_items):
     cache_filepath = mvn_cache_path()
     if cache_filepath.exists():
         return torch.load(cache_filepath)
+    if mvn_split() != TRAIN_SPLIT:
+        dataset_items = [item for item in load_split(mvn_split()) if MIN_TRAIN_SEC <= item["sec"] <= MAX_TRAIN_SEC]
 
     deterministic_rng = random.Random(SEED)
     sampled_items = deterministic_rng.sample(dataset_items, min(MVN_N, len(dataset_items)))
@@ -545,10 +626,11 @@ def build_multimodal_inputs(batch, model, audio_projector, tokenizer, prompt_tok
 
     sequence_embeddings_list = []
     token_labels_list = []
+    proj_dtype = next(audio_projector.parameters()).dtype
 
     for item in batch:
         # 1. Project stacked mel features (num_audio_tokens, STACK * N_MELS) -> (num_audio_tokens, hidden_size)
-        audio_features = item["audio"].to(DEVICE, audio_projector.weight.dtype)
+        audio_features = item["audio"].to(DEVICE, proj_dtype)
         projected_audio_embeds = audio_projector(audio_features).to(DTYPE)
 
         # 2. Embed prompt and (if training) target text
@@ -593,11 +675,73 @@ def build_multimodal_inputs(batch, model, audio_projector, tokenizer, prompt_tok
     return padded_inputs_embeds, attention_mask, target_labels
 
 
-def load_model_and_projector(saved_run_dir=None):
+class ConvAudioProjector(nn.Module):
     """
-    Load base language model, tokenizer, and linear audio projector.
-    If saved_run_dir is provided, loads trained LoRA weights and projector state dict from disk.
-    Otherwise, initializes a fresh LoRA adapter and randomly initialized linear projector.
+    Mel-LLM / NeMo-style strided 1D conv subsampler + 2-layer GELU MLP over continuous mel frames.
+    Unpacks SpeechDataset's (num_tokens, STACK * N_MELS) back to (num_tokens * STACK, N_MELS) so kernel_size=3
+    windows cross patch boundaries, downsamples by STACK in log2(STACK) stride-2 stages, and outputs
+    (num_tokens, hidden_size). Implemented via unfold + Linear (rocBLAS GEMM) to avoid MIOpen dynamic-length stalls.
+    """
+
+    def __init__(self, n_mels, stack, hidden_size):
+        super().__init__()
+        n_stages = int(round(math.log2(stack)))
+        if 2 ** n_stages != stack or n_stages < 1:
+            raise ValueError(f"PROJECTOR='conv' requires STACK to be a power of 2 >= 2, got {stack}")
+        self.n_mels = n_mels
+        self.convs = nn.ModuleList()
+        in_channels = n_mels
+        for stage in range(n_stages):
+            out_channels = hidden_size // 2 if stage == 0 and n_stages > 1 else hidden_size
+            self.convs.append(nn.Linear(3 * in_channels, out_channels))
+            in_channels = out_channels
+        self.norm = nn.LayerNorm(hidden_size)
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.act = nn.GELU()
+        self.out = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, stacked_audio):
+        x = stacked_audio.reshape(-1, self.n_mels)  # (T * STACK, N_MELS)
+        for conv_linear in self.convs:
+            windows = F.pad(x, (0, 0, 1, 1)).unfold(0, 3, 2).reshape(x.shape[0] // 2, -1)
+            x = self.act(conv_linear(windows))
+        return self.out(self.act(self.fc1(self.norm(x))))
+
+
+def build_audio_projector(hidden_dimension, embedding_std):
+    """Build PROJECTOR ('linear', 'mlp', or 'conv') and initialize its final linear layer per PROJ_INIT."""
+    patch_dim = STACK * N_MELS
+    if PROJECTOR == "linear":
+        projector = nn.Linear(patch_dim, hidden_dimension)
+        out_linear = projector
+    elif PROJECTOR == "mlp":
+        out_linear = nn.Linear(hidden_dimension, hidden_dimension)
+        projector = nn.Sequential(nn.LayerNorm(patch_dim), nn.Linear(patch_dim, hidden_dimension), nn.GELU(), out_linear)
+    elif PROJECTOR == "conv":
+        projector = ConvAudioProjector(N_MELS, STACK, hidden_dimension)
+        out_linear = projector.out
+    else:
+        raise ValueError(f"unknown PROJECTOR {PROJECTOR!r} (expected one of {PROJECTORS})")
+
+    if PROJ_INIT == "match_emb":
+        for module in projector.modules():
+            if isinstance(module, (nn.Conv1d, nn.Linear)) and module is not out_linear:
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")  # keeps GELU activations ~ unit variance
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        nn.init.normal_(out_linear.weight, std=embedding_std / math.sqrt(out_linear.in_features))
+        nn.init.zeros_(out_linear.bias)
+    elif PROJ_INIT != "default":
+        raise ValueError(f"unknown PROJ_INIT {PROJ_INIT!r} (expected 'match_emb' or 'default')")
+    return projector.to(DEVICE, trainable_dtype())
+
+
+def load_model_and_projector(saved_run_dir=None, trainable=False):
+    """
+    Load base language model, tokenizer, and audio projector.
+    If saved_run_dir is provided, loads trained LoRA weights and projector state dict from disk (trainable=True keeps
+    the loaded LoRA weights trainable, for INIT_FROM). Otherwise, initializes a fresh LoRA adapter and randomly
+    initialized projector.
 
     Returns:
         tuple: (tokenizer, model, audio_projector)
@@ -605,9 +749,8 @@ def load_model_and_projector(saved_run_dir=None):
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=DTYPE).to(DEVICE)
     hidden_dimension = model.config.hidden_size
-
-    # Linear projector: projects stacked mel frames (STACK * N_MELS) -> hidden_dimension, in trainable_dtype()
-    audio_projector = nn.Linear(STACK * N_MELS, hidden_dimension).to(DEVICE, trainable_dtype())
+    embedding_std = model.get_input_embeddings().weight.float().std().item()
+    audio_projector = build_audio_projector(hidden_dimension, embedding_std)
     # PEFT upcasts LoRA weights to fp32 by default; in "bf16" mode keep them in the base model's DTYPE
     upcast_lora = trainable_dtype() == torch.float32
 
@@ -623,7 +766,8 @@ def load_model_and_projector(saved_run_dir=None):
     else:
         lora_weights_path = os.path.join(saved_run_dir, "lora")
         projector_weights_path = os.path.join(saved_run_dir, "proj.pt")
-        model = PeftModel.from_pretrained(model, lora_weights_path, autocast_adapter_dtype=upcast_lora)
+        model = PeftModel.from_pretrained(model, lora_weights_path, is_trainable=trainable,
+                                          autocast_adapter_dtype=upcast_lora)
         audio_projector.load_state_dict(torch.load(projector_weights_path, map_location=DEVICE))
 
     return tokenizer, model, audio_projector
@@ -646,15 +790,47 @@ def describe_lora_placement(model):
 def normalize_text_for_wer(text):
     """
     Standardize text for Word Error Rate (WER) computation:
-    lowercase, retain only letters/apostrophes/spaces, and collapse multiple spaces.
+    lowercase, retain only letters/digits/apostrophes/spaces, and collapse multiple spaces.
     """
-    text = re.sub(r"[^a-z' ]", " ", text.lower())
+    text = re.sub(r"[^a-z0-9' ]", " ", text.lower())
     return re.sub(r"\s+", " ", text).strip()
+
+
+def decode_token_budget(audio_seconds):
+    """Max new tokens for one utterance: MAX_TOKENS_PER_SEC * sec + MAX_TOKENS_PAD, never above MAX_NEW_TOKENS."""
+    if MAX_TOKENS_PER_SEC <= 0:
+        return MAX_NEW_TOKENS
+    return min(MAX_NEW_TOKENS, math.ceil(MAX_TOKENS_PER_SEC * audio_seconds) + MAX_TOKENS_PAD)
+
+
+def generate_transcripts(model, tokenizer, inputs_embeds, attention_mask, audio_seconds):
+    """
+    Greedy-decode a left-padded batch (train.py eval and benchmark.py share this). The batch runs up to the largest
+    per-utterance budget (decode_token_budget), then each hypothesis is cut to its own budget, so a looping
+    utterance cannot emit more than ~MAX_TOKENS_PER_SEC tokens per second of audio.
+
+    Returns:
+        list[str]: decoded hypotheses (special tokens skipped), one per batch row.
+    """
+    budgets = [decode_token_budget(sec) for sec in audio_seconds]
+    extra_kwargs = {"no_repeat_ngram_size": NO_REPEAT_NGRAM_SIZE} if NO_REPEAT_NGRAM_SIZE > 0 else {}
+    generated_token_ids = model.generate(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        max_new_tokens=max(budgets),
+        do_sample=False,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        use_cache=True,
+        **extra_kwargs,
+    )
+    return [tokenizer.decode(tokens[:budget], skip_special_tokens=True)
+            for tokens, budget in zip(generated_token_ids, budgets)]
 
 
 @torch.no_grad()
 def evaluate_dataset(dataset_items, mvn_stats, tokenizer, model, audio_projector, output_hypotheses_path=None,
-                     progress_desc="eval"):
+                     progress_desc="eval", audio_ablation="none"):
     """
     Evaluate Word Error Rate (WER) and audio token throughput on a set of utterances using greedy decoding.
 
@@ -666,6 +842,9 @@ def evaluate_dataset(dataset_items, mvn_stats, tokenizer, model, audio_projector
         audio_projector (nn.Linear): Audio projector.
         output_hypotheses_path (str, optional): If specified, write {id, ref, hyp} JSONL to this file.
         progress_desc (str): Label shown on the tqdm progress bar.
+        audio_ablation (str): "none" | "shuffle" (each utt is decoded from its length-sorted batch neighbour's audio,
+            scored against its own reference) | "zeros" (all-zero mel patches). A model that uses the audio gets a
+            much higher WER under either ablation; one that ignores it scores about the same.
 
     Returns:
         dict: Evaluation metrics containing 'wer', 'sub', 'del', 'ins' (rates), 'n_utt', 'n_words',
@@ -690,6 +869,12 @@ def evaluate_dataset(dataset_items, mvn_stats, tokenizer, model, audio_projector
 
     progress_bar = make_progress_bar(total=len(dataset_items), desc=progress_desc, unit="utt", leave=False)
     for batch in create_dataloader(speech_dataset, evaluation_batches):
+        if audio_ablation == "shuffle":
+            batch = [dict(item, audio=batch[(i + 1) % len(batch)]["audio"]) for i, item in enumerate(batch)]
+        elif audio_ablation == "zeros":
+            batch = [dict(item, audio=torch.zeros_like(item["audio"])) for item in batch]
+        elif audio_ablation != "none":
+            raise ValueError(f"unknown audio ablation {audio_ablation!r} (expected 'none', 'shuffle' or 'zeros')")
         with compute_context():
             inputs_embeds, attention_mask, _ = build_multimodal_inputs(
                 batch,
@@ -700,18 +885,12 @@ def evaluate_dataset(dataset_items, mvn_stats, tokenizer, model, audio_projector
                 is_train=False,
             )
 
-            generated_token_ids = model.generate(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id,
-                use_cache=True,
+            decoded_texts = generate_transcripts(
+                model, tokenizer, inputs_embeds, attention_mask,
+                audio_seconds=[item["audio"].shape[0] * STACK * HOP / SR for item in batch],
             )
 
-        for item, gen_tokens in zip(batch, generated_token_ids):
-            decoded_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+        for item, decoded_text in zip(batch, decoded_texts):
             normalized_hyp = normalize_text_for_wer(decoded_text)
             normalized_ref = normalize_text_for_wer(item["text"])
 
@@ -767,8 +946,8 @@ def run_test_evaluation(run_dir, mvn_stats, tokenizer, model, audio_projector, l
     log_fn = log_fn or (lambda message: tqdm.write(message, file=sys.stdout))
     test_results = {}
     for split_name in TEST_SPLITS:
-        hypotheses_filepath = os.path.join(run_dir, f"hyp_{split_name}.jsonl")
-        split_items = load_librispeech_split(split_name)
+        hypotheses_filepath = os.path.join(run_dir, f"hyp_{split_name.replace('/', '-')}.jsonl")
+        split_items = load_split(split_name)
         test_results[split_name] = evaluate_dataset(
             split_items,
             mvn_stats=mvn_stats,
@@ -789,6 +968,8 @@ def run_test_evaluation(run_dir, mvn_stats, tokenizer, model, audio_projector, l
 # ---------------------------------------------------------------- train
 def main():
     args, config = parse_args()
+    if config["INIT_FROM"] and not args.eval_only:
+        config = resolve_init_from(config)
     apply_config(config)
     seed_everything(SEED)
 
@@ -878,6 +1059,27 @@ def main():
     log_file.close()
 
 
+INIT_MUST_MATCH = ("MODEL", "STACK", "N_MELS", "SR", "N_FFT", "HOP", "MVN_N", "PROJECTOR", "LORA_R", "LORA_ALPHA",
+                   "LORA_TARGETS", "PROMPT")  # tuple, so it is not picked up as a config constant
+
+
+def resolve_init_from(config):
+    """
+    INIT_FROM: check the init run's architecture / feature keys match this config, and (unless MVN_SPLIT is set)
+    reuse the init run's MVN stats so the warm-started weights see identically normalised mel features.
+    """
+    init_config = json.load(open(Path(config["INIT_FROM"], "config.json")))
+    init_config.setdefault("PROJECTOR", "linear")
+    mismatched = {key: (init_config.get(key), config[key]) for key in INIT_MUST_MATCH
+                  if key in init_config and init_config[key] != config[key]}
+    if mismatched:
+        raise SystemExit(f"INIT_FROM {config['INIT_FROM']}: config differs from the init run as (init, now): "
+                         f"{mismatched}; pass e.g. --config {config['INIT_FROM']}/config.json")
+    if not config["MVN_SPLIT"]:
+        config = dict(config, MVN_SPLIT=init_config.get("MVN_SPLIT") or unweighted_split(init_config["TRAIN_SPLIT"]))
+    return config
+
+
 def override_name_suffix(config):
     """
     Short run-name suffix from the hyperparameters that differ from the defaults, so runs/ is readable at a glance:
@@ -886,8 +1088,12 @@ def override_name_suffix(config):
     short = {"BATCH_SIZE": "bs", "GRAD_ACCUM": "ga", "LORA_R": "r", "LORA_ALPHA": "a", "LORA_DROPOUT": "ldrop",
              "LORA_TARGETS": "lora", "WARMUP_STEPS": "warmup", "WEIGHT_DECAY": "wd", "GRAD_CLIP": "clip",
              "LR_SCHEDULE": "sched", "MIN_LR_RATIO": "minlr", "OPTIMIZER": "opt", "MUON_ADJUST_LR": "muonlr",
-             "TRAIN_SPLIT": "train", "PRECISION": "prec", "MAX_TRAIN_SEC": "maxsec"}
-    skip = runs_lib.IGNORED_KEYS | {"MODEL", "STACK", "EVAL_EVERY", "VAL_N", "TEST_SPLITS", "DATA", "MAX_NEW_TOKENS"}
+             "TRAIN_SPLIT": "train", "PRECISION": "prec", "MAX_TRAIN_SEC": "maxsec", "MIN_TRAIN_SEC": "minsec",
+             "TRAIN_N": "n", "VAL_FROM_TRAIN": "valtrain", "PROJECTOR": "proj", "PROJ_INIT": "pinit",
+             "PROJ_LR_MULT": "plr", "PROJ_ONLY_STEPS": "ponly", "TRAIN_STEPS": "steps"}
+    skip = runs_lib.IGNORED_KEYS | {"MODEL", "STACK", "EVAL_EVERY", "VAL_N", "TEST_SPLITS", "DATA", "MAX_NEW_TOKENS",
+                                    "MAX_TOKENS_PER_SEC", "MAX_TOKENS_PAD", "NO_REPEAT_NGRAM_SIZE", "INIT_FROM", "MVN_SPLIT",
+                                    "EVAL_AUDIO_ABLATIONS"}
     parts = []
     for key, val in config.items():
         if key in skip or key not in DEFAULT_CONFIG or val == DEFAULT_CONFIG[key]:
@@ -903,30 +1109,42 @@ def train(args, run_dir, tracker, log_and_print):
     log_and_print(f"model {MODEL} | device {torch.cuda.get_device_name(0)} | dtype {DTYPE} | precision {PRECISION}")
 
     # Load dataset splits
-    train_items = [item for item in load_librispeech_split(TRAIN_SPLIT) if item["sec"] <= MAX_TRAIN_SEC]
-    validation_items = sorted(load_librispeech_split(VAL_SPLIT), key=lambda it: it["id"])[:VAL_N]
-    mvn_stats = compute_or_load_mvn_stats(train_items)
+    train_items = [item for item in load_split(TRAIN_SPLIT) if MIN_TRAIN_SEC <= item["sec"] <= MAX_TRAIN_SEC]
+    mvn_stats = compute_or_load_mvn_stats(train_items)  # always from the full split, so TRAIN_N runs share the cache
+    if TRAIN_N:
+        train_items = sorted(random.Random(SEED).sample(train_items, TRAIN_N), key=lambda it: it["id"])
+    if VAL_FROM_TRAIN:
+        validation_items = train_items[:VAL_N]
+    else:
+        validation_items = sorted(load_split(VAL_SPLIT), key=lambda it: it["id"])[:VAL_N]
+    val_name = f"{TRAIN_SPLIT}(train)" if VAL_FROM_TRAIN else VAL_SPLIT
+    val_ablations = [name.strip() for name in EVAL_AUDIO_ABLATIONS.split(",") if name.strip()]
 
     total_train_hours = sum(item["sec"] for item in train_items) / 3600.0
     log_and_print(f"train utts {len(train_items)} ({total_train_hours:.1f} h), val utts {len(validation_items)}")
     log_and_print(
         f"batch {BATCH_SIZE} x accum {GRAD_ACCUM} = {BATCH_SIZE * GRAD_ACCUM} | {OPTIMIZER} lr {LR:.1e} {LR_SCHEDULE} warmup {WARMUP_STEPS} "
-        f"| epochs {EPOCHS} | stack {STACK} ({SR / HOP / STACK:.2f} Hz audio tokens, {STACK * N_MELS}-d patches) | lora r{LORA_R} a{LORA_ALPHA} on LLM {LORA_TARGETS}"
+        f"| epochs {EPOCHS}{f' (train_steps {TRAIN_STEPS})' if TRAIN_STEPS else ''} | stack {STACK} ({SR / HOP / STACK:.2f} Hz audio tokens, {STACK * N_MELS}-d patches) | lora r{LORA_R} a{LORA_ALPHA} on LLM {LORA_TARGETS}"
     )
 
     # Initialize model and linear projector
-    tokenizer, model, audio_projector = load_model_and_projector()
+    tokenizer, model, audio_projector = load_model_and_projector(INIT_FROM or None, trainable=True)
+    if INIT_FROM:
+        log_and_print(f"init: LoRA + projector weights from {INIT_FROM} (fresh optimizer and LR schedule)")
     if GRAD_CKPT:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.train()
 
     # Muon only takes 2D matrices and nothing falls back to AdamW, so the (1D) projector bias stays at its init
     if OPTIMIZER == "muon":
+        if PROJECTOR != "linear":
+            raise ValueError(f"OPTIMIZER='muon' requires PROJECTOR='linear' (2D weights only), got {PROJECTOR!r}")
         audio_projector.bias.requires_grad_(False)
 
     # Collect trainable parameters (LoRA adapter weights + linear projector)
     trainable_lora_params = [param for param in model.parameters() if param.requires_grad]
-    all_trainable_params = trainable_lora_params + [p for p in audio_projector.parameters() if p.requires_grad]
+    trainable_proj_params = [p for p in audio_projector.parameters() if p.requires_grad]
+    all_trainable_params = trainable_lora_params + trainable_proj_params
 
     lora_param_count_m = sum(param.numel() for param in trainable_lora_params) / 1e6
     proj_param_count_m = sum(param.numel() for param in audio_projector.parameters()) / 1e6
@@ -934,18 +1152,21 @@ def train(args, run_dir, tracker, log_and_print):
                   f"({sorted({str(p.dtype).removeprefix('torch.') for p in all_trainable_params})})")
     log_and_print(describe_lora_placement(model))
 
+    # Two param groups so the projector can get its own lr (PROJ_LR_MULT) and LoRA can start late (PROJ_ONLY_STEPS)
+    param_groups = [{"params": trainable_lora_params}, {"params": trainable_proj_params}]
     if OPTIMIZER == "adamw":
-        optimizer = torch.optim.AdamW(all_trainable_params, lr=LR, weight_decay=WEIGHT_DECAY, betas=(0.9, 0.999))
+        optimizer = torch.optim.AdamW(param_groups, lr=LR, weight_decay=WEIGHT_DECAY, betas=(0.9, 0.999))
     elif OPTIMIZER == "muon":
-        optimizer = torch.optim.Muon(all_trainable_params, lr=LR, weight_decay=WEIGHT_DECAY, adjust_lr_fn=MUON_ADJUST_LR)
+        optimizer = torch.optim.Muon(param_groups, lr=LR, weight_decay=WEIGHT_DECAY, adjust_lr_fn=MUON_ADJUST_LR)
         log_and_print(f"optimizer: Muon ({MUON_ADJUST_LR}) on all {len(all_trainable_params)} trainable 2D weights, "
                       "no AdamW (projector bias frozen)")
     else:
         raise ValueError(f"unknown OPTIMIZER {OPTIMIZER!r} (expected 'adamw' or 'muon')")
 
     # Calculate steps and learning rate schedule: linear warmup, then cosine or linear decay
-    steps_per_epoch = math.ceil(len(train_items) / BATCH_SIZE) // GRAD_ACCUM
-    total_optimizer_steps = args.max_steps or (steps_per_epoch * EPOCHS)
+    steps_per_epoch = max(1, math.ceil(len(train_items) / BATCH_SIZE) // GRAD_ACCUM)
+    total_optimizer_steps = args.max_steps or TRAIN_STEPS or (steps_per_epoch * EPOCHS)
+    num_epochs = math.ceil(total_optimizer_steps / steps_per_epoch)
 
     def compute_lr_multiplier(step_idx):
         if step_idx < WARMUP_STEPS:
@@ -957,8 +1178,22 @@ def train(args, run_dir, tracker, log_and_print):
             return 1.0 - decay_progress
         raise ValueError(f"unknown LR_SCHEDULE {LR_SCHEDULE!r} (expected 'cosine' or 'linear')")
 
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=compute_lr_multiplier)
-    log_and_print(f"steps/epoch {steps_per_epoch}, total steps {total_optimizer_steps}")
+    def compute_lora_lr_multiplier(step_idx):
+        """0 while only the projector trains, then a fresh linear warmup into the shared schedule."""
+        if step_idx < PROJ_ONLY_STEPS:
+            return 0.0
+        return min(1.0, (step_idx - PROJ_ONLY_STEPS + 1) / max(1, WARMUP_STEPS)) * compute_lr_multiplier(step_idx)
+
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=[compute_lora_lr_multiplier if PROJ_ONLY_STEPS else compute_lr_multiplier,
+                   lambda step_idx: PROJ_LR_MULT * compute_lr_multiplier(step_idx)],
+    )
+    log_and_print(f"steps/epoch {steps_per_epoch}, total steps {total_optimizer_steps} | proj {PROJECTOR} "
+                  f"(init {PROJ_INIT}, lr x{PROJ_LR_MULT}), LoRA frozen for first {PROJ_ONLY_STEPS} steps")
+    if TRAIN_N or VAL_FROM_TRAIN or val_ablations:
+        log_and_print(f"diagnostics: train subset {TRAIN_N or 'all'}, val on {val_name}[:{VAL_N}], "
+                      f"audio ablations {val_ablations or 'none'}")
 
     prompt_token_ids = tokenizer(PROMPT, add_special_tokens=False).input_ids
     train_dataset = SpeechDataset(train_items, mvn_stats, tokenizer)
@@ -973,6 +1208,7 @@ def train(args, run_dir, tracker, log_and_print):
         return {
             "start_time": time.time(), "loss_sum": 0.0, "micro_steps": 0, "tokens": 0, "padded_tokens": 0,
             "target_tokens": 0, "utts": 0, "audio_sec": 0.0, "data_wait_sec": 0.0, "grad_norms": [],
+            "lora_grad_norms": [], "proj_grad_norms": [],
         }
 
     window = reset_window_stats()
@@ -980,10 +1216,10 @@ def train(args, run_dir, tracker, log_and_print):
 
     progress_bar = make_progress_bar(total=total_optimizer_steps, desc="train", unit="step")
 
-    for epoch in range(EPOCHS):
+    for epoch in range(num_epochs):
         epoch_sampler = create_length_batched_sampler(train_items, BATCH_SIZE, seed=SEED + epoch)
         dataloader = create_dataloader(train_dataset, epoch_sampler)
-        progress_bar.set_description(f"train ep {epoch + 1}/{EPOCHS}")
+        progress_bar.set_description(f"train ep {epoch + 1}/{num_epochs}")
 
         data_wait_start = time.time()
         for batch in dataloader:
@@ -1017,12 +1253,21 @@ def train(args, run_dir, tracker, log_and_print):
                 data_wait_start = time.time()
                 continue
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(all_trainable_params, GRAD_CLIP).item()
+            if optimizer_step < PROJ_ONLY_STEPS:
+                for param in trainable_lora_params:  # LoRA frozen: drop its grads so they neither step nor eat the clip budget
+                    param.grad = None
+            # Clip LoRA and projector independently so neither component starves the other's gradient budget
+            lora_grad_norm = (torch.nn.utils.clip_grad_norm_(trainable_lora_params, GRAD_CLIP).item()
+                              if trainable_lora_params and optimizer_step >= PROJ_ONLY_STEPS else 0.0)
+            proj_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_proj_params, GRAD_CLIP).item()
+            grad_norm = math.hypot(lora_grad_norm, proj_grad_norm)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             optimizer_step += 1
             window["grad_norms"].append(grad_norm)
+            window["lora_grad_norms"].append(lora_grad_norm)
+            window["proj_grad_norms"].append(proj_grad_norm)
 
             current_lr = lr_scheduler.get_last_lr()[0]
             progress_bar.update(1)
@@ -1049,7 +1294,9 @@ def train(args, run_dir, tracker, log_and_print):
                     f"({optimizer_step / total_optimizer_steps * 100:.1f}%) | "
                     f"loss {average_loss:.4f} ppl {math.exp(min(average_loss, 20)):.2f} | "
                     f"gnorm {grad_norm:.2f} (avg {np.mean(grad_norms):.2f} max {np.max(grad_norms):.2f} "
-                    f"clipped {num_clipped}/{len(grad_norms)}) | lr {current_lr:.2e} | "
+                    f"clipped {num_clipped}/{len(grad_norms)}) | "
+                    f"pre-clip gnorm lora {np.mean(window['lora_grad_norms']):.2f} proj {np.mean(window['proj_grad_norms']):.2f} | "
+                    f"lr {current_lr:.2e} proj lr {lr_scheduler.get_last_lr()[1]:.2e} | "
                     f"elapsed {format_duration(total_elapsed)} eta {format_duration(eta_seconds)}"
                 )
                 log_and_print(
@@ -1066,6 +1313,9 @@ def train(args, run_dir, tracker, log_and_print):
                     "train", step=optimizer_step, epoch=round(epoch_progress, 4), loss=average_loss,
                     lr=current_lr, grad_norm=grad_norm, grad_norm_avg=float(np.mean(grad_norms)),
                     grad_norm_max=float(np.max(grad_norms)), clipped=num_clipped,
+                    lora_grad_norm_avg=float(np.mean(window["lora_grad_norms"])),
+                    proj_grad_norm_avg=float(np.mean(window["proj_grad_norms"])),
+                    proj_lr=lr_scheduler.get_last_lr()[1],
                     sec_per_step=elapsed_time / len(grad_norms), tok_per_sec=window["tokens"] / elapsed_time,
                     peak_mem_gb=torch.cuda.max_memory_allocated() / 2**30, elapsed_sec=total_elapsed,
                 )
@@ -1086,16 +1336,25 @@ def train(args, run_dir, tracker, log_and_print):
                 is_best = val_metrics["wer"] < best_val_wer
                 if is_best:
                     best_val_wer, best_val_step = val_metrics["wer"], optimizer_step
+                ablation_wers = {}
+                for ablation in val_ablations:
+                    ablation_wers[f"wer_{ablation}"] = evaluate_dataset(
+                        validation_items, mvn_stats=mvn_stats, tokenizer=tokenizer, model=model,
+                        audio_projector=audio_projector, progress_desc=f"val {ablation} @{optimizer_step}",
+                        audio_ablation=ablation,
+                    )["wer"]
+                ablation_text = "".join(f" | {key} {val * 100:.2f}" for key, val in ablation_wers.items())
                 log_and_print(
-                    f"[val] step {optimizer_step} {VAL_SPLIT}[:{VAL_N}] {format_eval_metrics(val_metrics)} | "
+                    f"[val] step {optimizer_step} {val_name}[:{VAL_N}] {format_eval_metrics(val_metrics)} | "
                     f"best {best_val_wer * 100:.2f} @ step {best_val_step}{' (new best)' if is_best else ''}"
+                    f"{ablation_text}"
                 )
                 for example in val_metrics["examples"]:
                     log_and_print(f"    [{example['id']}] REF: {example['ref']}")
                     log_and_print(f"    [{example['id']}] HYP: {example['hyp']}")
                 tracker.log_metrics(
                     "val", step=optimizer_step,
-                    **{key: val for key, val in val_metrics.items() if key != "examples"},
+                    **{key: val for key, val in val_metrics.items() if key != "examples"}, **ablation_wers,
                 )
                 tracker.update(
                     step=optimizer_step, total_steps=total_optimizer_steps,

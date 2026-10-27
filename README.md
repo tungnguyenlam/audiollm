@@ -23,7 +23,8 @@ patches, the `Linear` adapter, where LoRA sits, the final input sequence, run tr
 
 ```bash
 ./setup_rocm.sh                              # uv venv + ROCm torch
-uv run --no-project --python 3.12 --with pyarrow --with huggingface_hub python prepare_data.py   # ~7 GB
+./setup_dataset.sh                           # all of data/ (~83 GB); --minimal = train.py's LibriSpeech only (~7 GB)
+./setup_dataset.sh --check                   # verify data/ without downloading
 source .venv/bin/activate
 python train.py --max_steps 10               # smoke test
 python train.py                              # full run (230M model)
@@ -73,24 +74,52 @@ python runs.py latest                   # path of the newest run
 
 | role | data | size | used for |
 |---|---|---|---|
-| train | LibriSpeech `train-clean-100` (≤ 30 s) | 28,539 utts, 100.6 h, 251 speakers | the only training data |
+| train | `train-clean-100+train-clean-360+ami_ihm/train+fleurs_en/train` (1–30 s) | 204,286 utts, 544.0 h | default training mixture (`--train_split train-clean-100` for the 100 h single-corpus control) |
 | val | first 200 `dev-clean` utts by id | 200 utts, 23 min, **3 of 40 speakers** | in-training WER, picking the best run per LLM |
 | test | `test-clean`, `test-other` | 5.4 h + 5.3 h | `train.py`'s own end-of-run WER |
-| benchmark | Open ASR test sets (below) | ~40 h total | `benchmark.py`, after training |
+| benchmark | 7 Open ASR sets (`data/esb/`) + local `fleurs_en`, `edacc` test sets | ~59 h total | `benchmark.py`, after training |
 
-All splits are speaker-disjoint. **Only LibriSpeech has a train or dev split here.** VoxPopuli, AMI, Earnings-22,
-GigaSpeech and SPGISpeech are test-only (zero-shot, out of domain). The val subset is deterministic but narrow (3
-speakers, clean read speech), so treat small val WER differences as noise.
+All splits are speaker-disjoint. VoxPopuli, Earnings-22, GigaSpeech, SPGISpeech and EdAcc are test-only (zero-shot,
+out of domain); LibriSpeech, AMI IHM and FLEURS have train/dev/test splits. The val subset is deterministic but narrow
+(3 speakers, clean read speech), so treat small val WER differences as noise.
 
 **More corpora:** [docs/DATASETS.md](docs/DATASETS.md) ranks English ASR corpora and audio-understanding datasets
 by annotation quality, with a short summary and a citation (BibTeX) for each. `download_corpora.py --list` shows
 the registry. The default set (≈ 58 GB, keeping `data/` ≤ 100 GB) adds:
 - LibriSpeech `train-clean-360` and `dev-other` (via `prepare_data.py`);
-- AMI IHM, FLEURS en_us and EdAcc;
-- Speech Commands, Clotho-AQA, ESC-50, VocalSound and CREMA-D;
-- the MMAU test-mini and AIR-Bench benchmarks.
+- AMI IHM and FLEURS en_us (unpacked to `data/asr_corpora/<corpus>/<split>/` by `unpack_parquet_asr_corpora.py` and wired into `train.py`), plus EdAcc (wired into `benchmark.py`);
+- Speech Commands, Clotho-AQA, ESC-50, VocalSound, CREMA-D, MMAU test-mini and AIR-Bench (kept out of ASR training).
 
-These corpora are downloaded but **not wired into `train.py` yet**.
+### Dataset viewer (quality check before pretraining)
+
+```bash
+python -m dataset_viewer            # http://127.0.0.1:8765  (--port, --data, --db)
+```
+
+A local web page over everything in `data/`. Each corpus split is a separate dataset (37 at the moment).
+- **Inspect samples**: play the audio (speed, gain, loop a dragged region), with the waveform (clipped samples in
+  red) and the spectrogram. The spectrogram has two views: the *model view* (16 kHz HTK log-mel 80 that `train.py`
+  computes) and a *linear STFT at the native rate*, which shows the file's true bandwidth. The page also shows the
+  transcript/labels, every metadata column, and signal metrics with automatic flags. You mark each sample
+  keep / reject / flag, with tags and a note (keys `1/2/3/0`, `j/k` to move; `?` lists all shortcuts).
+- **Quality report**: scans a random subset (or the whole split) and shows histograms, percentiles and
+  flag rates (clipping, low SNR, narrowband, mostly silent, quiet, text rate too fast or too slow, …). From there you
+  can open the worst rows in the inspector, or bulk-reject every row that has a given flag.
+- **Decision per dataset**: *Include / Exclude / Undecided* for pretraining, with a note.
+
+State is kept in `data/curation.sqlite3`. **Export curation manifest** (sidebar) writes JSON that lists, for each
+dataset, the decision and the rejected/flagged sample keys. A key is `<parquet file relative to corpus dir>#<row>`,
+or the utterance id for LibriSpeech. To use it in training code:
+
+```python
+from dataset_viewer.curation import load_curation
+cur = load_curation("curation_manifest.json")      # or load_curation(db="data/curation.sqlite3")
+cur.included_datasets(); cur.keep(dataset_id, key)
+```
+
+The metrics are heuristics for *finding* bad rows quickly, so listen before you reject. "Est. SNR" is the
+p95−p10 spread of frame energy, not a true SNR. "Text rate" is alphanumeric characters per second of audio.
+The thresholds are in `dataset_viewer/audio.py` (`THRESHOLDS`).
 
 ## Benchmark
 
@@ -100,14 +129,15 @@ runs it on all sets right after training (with the model already in memory) and 
 `runs/<id>/summary.json`. Audio that isn't 16 kHz (most of Earnings-22) is resampled with `soxr`.
 
 ```bash
-python benchmark.py mel:runs/latest                               # all 7 sets (~20 GB download, cached in data/esb/)
-python benchmark.py mel:runs/baseline_fixed12.5hz --sets earnings22 ami   # some sets (merged into earlier results)
+python benchmark.py mel:runs/latest                               # 7 Open ASR sets + local fleurs_en/edacc test sets
+python benchmark.py mel:runs/latest --sets openasr                # only the 7 Open ASR Leaderboard sets
+python benchmark.py mel:runs/baseline_fixed12.5hz --sets earnings22 ami fleurs_en edacc   # selected sets (merged)
 python benchmark.py hf:openai/whisper-large-v3 --sets librispeech_clean librispeech_other
 python benchmark.py --table                                       # paper rows + hf baselines + best run per base LLM (by val WER) with its config
 python benchmark.py --table --all_runs                            # ... plus every other benchmarked mel: run
 ```
 
-`--limit N` evaluates N evenly spaced utterances per set for smoke tests. Data is cached in `data/esb/`.
+`--limit N` evaluates N evenly spaced utterances per set for smoke tests. ESB data is cached in `data/esb/`; `fleurs_en` and `edacc` are read from `data/corpora/` and shown alongside the leaderboard columns without altering `OpenASR avg`.
 
 ## What is fixed (the "control")
 
@@ -116,10 +146,10 @@ with a flag, and the resolved values are saved in each run's `config.json`.
 
 | | value | note |
 |---|---|---|
-| data | train-clean-100 (≤30 s), val = first 200 dev-clean by id, test = test-clean + test-other | see [Data](#data) |
+| data | `train-clean-100+train-clean-360+ami_ihm/train+fleurs_en/train` (1–30 s, 544 h), val = first 200 dev-clean by id, test = test-clean + test-other | `--train_split train-clean-100` for 100 h only; see [Data](#data) |
 | features | 80 log-mel, HTK filterbank, `log(mel+1e-6)`, global per-bin MVN from 2000 seeded train utts | cached in `data/LibriSpeech/mvn_*.pt`, keyed by split/N/SR/N_FFT/HOP/N_MELS |
 | tokenization | stack 16 frames → 1280-d patches at 6.25 Hz, zero-pad tail | paper's ASR rate is stack 8 / 12.5 Hz (640-d < 1024 hidden); `--stack 8` reproduces it |
-| projector | single `nn.Linear`, random init | |
+| projector | single `nn.Linear`, `PROJ_INIT=match_emb` (`N(0, emb_std/sqrt(fan_in))`, zero bias) | `--proj_init default` for PyTorch's default init (~20× larger than text embeddings) |
 | LLM | LFM2.5-230M-Base, bf16, frozen + LoRA r64/α128 (`LORA_TARGETS=all-linear`: conv `in_proj`/`out_proj`, attn `q/k/v/out_proj`, MLP `w1/w2/w3`; not embeddings/`lm_head`) | no quantization; 2.6B-Base for paper-scale runs |
 | precision | `PRECISION=bf16`: LoRA + projector weights, grads and AdamW states all bf16 | `amp` = fp32 master weights + bf16 autocast; `fp32` = runs before 2026-10-27 (fp32 LoRA/projector, ~1.65x slower/step) |
 | optim | AdamW lr 1e-4, 200 warmup → cosine decay (`--lr_schedule linear` for the old schedule), clip 1.0, eff. batch 32, 2 epochs; `--optimizer muon` = `torch.optim.Muon` on every trainable 2D weight (LoRA A/B + projector weight), no AdamW at all (projector bias frozen), `--muon_adjust_lr match_rms_adamw` so the AdamW lr/wd carry over | paper's lr/clip |

@@ -26,7 +26,7 @@ import numpy as np
 RUNS_DIR = Path("runs")
 # Config keys that are bookkeeping rather than hyperparameters; never shown as "differing" columns.
 IGNORED_KEYS = {"RUN_NAME", "NUM_WORKERS", "LOG_EVERY", "LOG_N_EXAMPLES", "DEVICE", "EVAL_BATCH_SIZE", "PLOT_EVERY",
-                "BENCHMARK_SETS"}
+                "BENCHMARK_SETS", "ASR_CORPORA", "EVAL_AUDIO_ABLATIONS"}
 
 
 def load_run(run_dir):
@@ -142,6 +142,9 @@ def plot_run(run_dir):
 
         ax_gnorm.plot(steps, col(train, "grad_norm_avg"), label="avg (pre-clip)")
         ax_gnorm.plot(steps, col(train, "grad_norm_max"), alpha=0.5, label="max (pre-clip)")
+        if train[0].get("lora_grad_norm_avg") is not None:
+            ax_gnorm.plot(steps, col(train, "lora_grad_norm_avg"), "--", alpha=0.8, label="lora avg")
+            ax_gnorm.plot(steps, col(train, "proj_grad_norm_avg"), "--", alpha=0.8, label="proj avg")
         if cfg.get("GRAD_CLIP"):
             ax_gnorm.axhline(cfg["GRAD_CLIP"], color="red", ls="--", lw=1, label=f"clip {cfg['GRAD_CLIP']}")
         clipped = sum(col(train, "clipped"))
@@ -166,6 +169,9 @@ def plot_run(run_dir):
         for key in ("sub", "del", "ins"):
             if val[0].get(key) is not None:
                 ax_val.plot(val_steps, [100 * v for v in col(val, key)], ".--", alpha=0.7, label=key)
+        for key in ("wer_shuffle", "wer_zeros"):
+            if val[0].get(key) is not None:
+                ax_val.plot(val_steps, [100 * v for v in col(val, key)], "x:", alpha=0.8, label=key)
         if summary.get("best_val_step") is not None:
             ax_val.axvline(summary["best_val_step"], color="gray", ls=":", lw=1, label=f"best @ {summary['best_val_step']}")
         for split, wer in summary.get("test_wer", {}).items():
@@ -176,7 +182,7 @@ def plot_run(run_dir):
     for ax in axes.flat:
         ax.set_xlabel("optimizer step")
         ax.grid(alpha=0.3)
-    bench = summary.get("benchmark", {})
+    bench = {**summary.get("benchmark", {}), **summary.get("benchmark_extra", {})}
     bench_text = ("  |  benchmark: " + ", ".join(f"{k} {v:.2f}" for k, v in bench.items())) if bench else ""
     overrides = {k: v for k, v in run["meta"].get("overrides", {}).items() if k not in IGNORED_KEYS}
     fig.suptitle(f"{run['id']}  [{summary['status']}"
@@ -191,8 +197,10 @@ def plot_run(run_dir):
 
 
 def is_candidate(run):
-    """A finished full-length run with a saved checkpoint and a val WER (no smoke tests, failed or running runs)."""
+    """A finished full-length run with a saved checkpoint and a dev val WER (no smoke/subset/train-overfit runs)."""
+    cfg = run["config"]
     return ((run["dir"] / "proj.pt").exists() and not run["meta"].get("max_steps")
+            and not cfg.get("VAL_FROM_TRAIN") and not cfg.get("TRAIN_N")
             and run["summary"]["status"] == "done" and run["summary"].get("best_val_wer") is not None)
 
 

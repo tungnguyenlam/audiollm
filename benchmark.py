@@ -49,6 +49,14 @@ SETS = {
     "spgispeech": ("spgispeech", "test"),                # 11.6 GB
 }
 OPENASR_SETS = list(SETS)  # current leaderboard English short-form suite minus Common Voice (TED-LIUM was dropped)
+# Extra test sets already on disk from download_corpora.py: set name -> (parquet glob, reference text column).
+# Reported next to the leaderboard sets but kept out of its mean (and stored as "benchmark_extra" in a run's summary).
+LOCAL_SETS = {
+    "fleurs_en": ("data/corpora/fleurs_en/parquet-data/en_us/test-*.parquet", "raw_transcription"),  # read Wikipedia
+    "edacc": ("data/corpora/edacc/data/test-*.parquet", "text"),  # accented conversational English, never trained on
+}
+ALL_SETS = OPENASR_SETS + list(LOCAL_SETS)
+DECODE_KEYS = ("MAX_NEW_TOKENS", "MAX_TOKENS_PER_SEC", "NO_REPEAT_NGRAM_SIZE")  # train.py constants used by mel: decoding
 
 # Table II of arXiv 2606.10231 (WER %). Their Avg also includes TED-LIUM, so only compare per-set columns.
 PAPER = {
@@ -66,6 +74,8 @@ PAPER = {
 # ---------------------------------------------------------------- data
 def load_set(name, limit=None):
     """Return list of dicts {id, bytes, text, sec}. The ESB parquets are sorted by duration, longest first."""
+    if name in LOCAL_SETS:
+        return load_local_set(name, limit)
     config, prefix = SETS[name]
     files = sorted(f for f in list_repo_files(ESB_REPO, repo_type="dataset")
                    if f.startswith(f"{config}/{prefix}-") and f.endswith(".parquet"))
@@ -75,6 +85,27 @@ def load_set(name, limit=None):
         for r in pq.read_table(path, columns=["id", "text", "audio", "audio_length_s"]).to_pylist():
             items.append({"id": r["id"], "bytes": r["audio"]["bytes"], "text": r["text"], "sec": r["audio_length_s"]})
     if limit:  # evenly spaced subset so short and long utterances are both covered
+        items = [items[i] for i in np.linspace(0, len(items) - 1, min(limit, len(items))).astype(int)]
+    return items
+
+
+def load_local_set(name, limit=None):
+    """LOCAL_SETS test split as {id, bytes, text, sec}, sorted longest first like the ESB sets."""
+    pattern, text_column = LOCAL_SETS[name]
+    shards = sorted(Path().glob(pattern))
+    if not shards:
+        raise SystemExit(f"no parquet files for {name} ({pattern}); run download_corpora.py first")
+    items = []
+    for shard in shards:
+        for index, r in enumerate(pq.read_table(shard, columns=[text_column, "audio"]).to_pylist()):
+            text = (r[text_column] or "").strip()
+            if not text or text == "IGNORE_TIME_SEGMENT_IN_SCORING":
+                continue
+            info = sf.info(io.BytesIO(r["audio"]["bytes"]))
+            items.append({"id": f"{shard.stem}_{index}", "bytes": r["audio"]["bytes"], "text": text,
+                          "sec": info.frames / info.samplerate})
+    items.sort(key=lambda it: -it["sec"])
+    if limit:
         items = [items[i] for i in np.linspace(0, len(items) - 1, min(limit, len(items))).astype(int)]
     return items
 
@@ -100,6 +131,9 @@ class MelLLM:
         import train
         config = json.load(open(Path(run_dir, "config.json")))
         config.setdefault("PRECISION", "fp32")  # runs from before PRECISION existed trained fp32 LoRA/projector
+        config.setdefault("PROJ_INIT", "default")
+        config.setdefault("MIN_TRAIN_SEC", 0.0)
+        config.setdefault("PROJECTOR", "linear")
         train.apply_config(config)
         self.t = train
         self.run_dir = Path(run_dir)
@@ -122,10 +156,7 @@ class MelLLM:
         with t.compute_context():
             x, mask, _ = t.build_multimodal_inputs(feats, self.model, self.proj, self.tok, self.prompt_ids,
                                                    is_train=False)
-            out = self.model.generate(inputs_embeds=x, attention_mask=mask, max_new_tokens=t.MAX_NEW_TOKENS,
-                                      do_sample=False, eos_token_id=self.tok.eos_token_id,
-                                      pad_token_id=self.tok.pad_token_id, use_cache=True)
-        return [self.tok.decode(o, skip_special_tokens=True) for o in out]
+            return t.generate_transcripts(self.model, self.tok, x, mask, audio_seconds=[it["sec"] for it in batch])
 
 
 class HFPipeline:
@@ -172,18 +203,21 @@ def run(model, items, normalizer, out_path):
                     hyps.append(hyp_n)
     wall = time.time() - t0
     audio_sec = sum(it["sec"] for it in items)
-    return {"wer": round(100 * jiwer.wer(refs, hyps), 2), "n_utt": len(refs), "audio_hours": round(audio_sec / 3600, 2),
-            "rtfx": round(audio_sec / wall, 1)}
+    alignment = jiwer.process_words(refs, hyps)
+    n_ref = max(1, alignment.hits + alignment.substitutions + alignment.deletions)
+    return {"wer": round(100 * alignment.wer, 2), "sub": round(100 * alignment.substitutions / n_ref, 2),
+            "del": round(100 * alignment.deletions / n_ref, 2), "ins": round(100 * alignment.insertions / n_ref, 2),
+            "n_utt": len(refs), "audio_hours": round(audio_sec / 3600, 2), "rtfx": round(audio_sec / wall, 1)}
 
 
 def resolve_sets(sets):
     """"all" -> every set; also accepts a comma-separated string (train.py's BENCHMARK_SETS)."""
     if isinstance(sets, str):
         sets = [s for s in sets.split(",") if s]
-    sets = OPENASR_SETS if sets == ["all"] else list(sets)
-    unknown = [s for s in sets if s not in SETS]
+    sets = ALL_SETS if sets == ["all"] else OPENASR_SETS if sets == ["openasr"] else list(sets)
+    unknown = [s for s in sets if s not in ALL_SETS]
     if unknown:
-        raise SystemExit(f"unknown benchmark sets {unknown}; choose from {list(SETS)} or 'all'")
+        raise SystemExit(f"unknown benchmark sets {unknown}; choose from {ALL_SETS}, 'openasr' or 'all'")
     return sets
 
 
@@ -197,18 +231,21 @@ def update_run_summary(run_dir, **values):
     tmp.replace(path)
 
 
-def benchmark(model, tag, sets, limit=None, log=print, spec=None):
+def benchmark(model, tag, sets, limit=None, log=print, spec=None, track=True):
     """
     Run `model` on `sets`, writing results/<tag>/<set>.jsonl + summary.json (merged with earlier sets). For a mel:
-    run without --limit, also store {set: WER} under "benchmark" in the run's own summary.json. Returns the summary.
+    run without --limit (and track=True, i.e. the run's own decoding settings), also store {set: WER} under "benchmark"
+    in the run's own summary.json. Returns the summary.
     """
     out_dir = Path(RESULTS, tag)
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "summary.json"
     summary = json.load(open(summary_path)) if summary_path.exists() else {}
     summary["_model"] = f"mel:{model.run_dir}" if model.run_dir else spec  # mel: always the resolved run dir
+    if model.run_dir:
+        summary["_decode"] = {key: getattr(model.t, key) for key in DECODE_KEYS}
     normalizer = WhisperTokenizer.from_pretrained("openai/whisper-large-v3").normalize
-    track_run = model.run_dir is not None and not limit
+    track_run = model.run_dir is not None and not limit and track
     for name in sets:
         if track_run:
             update_run_summary(model.run_dir, benchmark_status=f"running {name}")
@@ -218,6 +255,7 @@ def benchmark(model, tag, sets, limit=None, log=print, spec=None):
         json.dump(summary, open(summary_path, "w"), indent=2)
         if track_run:
             update_run_summary(model.run_dir, benchmark={s: summary[s]["wer"] for s in OPENASR_SETS if s in summary},
+                               benchmark_extra={s: summary[s]["wer"] for s in LOCAL_SETS if s in summary},
                                benchmark_results=str(out_dir))
 
     done = [summary[s]["wer"] for s in OPENASR_SETS if s in summary]
@@ -243,7 +281,7 @@ def result_for_run(results, run_dir):
     ]
     if not matches:
         return None, None
-    return max(matches, key=lambda m: ("_limit" not in m[0], sum(s in m[1] for s in SETS), m[0]))
+    return max(matches, key=lambda m: ("_limit" not in m[0], sum(s in m[1] for s in ALL_SETS), m[0]))
 
 
 def print_table(all_runs=False):
@@ -258,14 +296,14 @@ def print_table(all_runs=False):
     rows = dict(PAPER)
     for tag, summary in results.items():
         if not summary.get("_model", "").startswith("mel:"):
-            rows[tag] = {k: v["wer"] for k, v in summary.items() if k in SETS}
+            rows[tag] = {k: v["wer"] for k, v in summary.items() if k in ALL_SETS}
 
     best_result_tags = set()
     train_eval_fallback = {"librispeech_clean": "test-clean", "librispeech_other": "test-other"}
     for model, (run, _) in best.items():
         tag, summary = result_for_run(results, run["dir"])
         best_result_tags.add(tag)
-        row = {k: v["wer"] for k, v in summary.items() if k in SETS} if summary else {}
+        row = {k: v["wer"] for k, v in summary.items() if k in ALL_SETS} if summary else {}
         for bench_set, split in train_eval_fallback.items():  # not benchmarked: show train.py's own test eval (†)
             if bench_set not in row and split in run["summary"].get("test_wer", {}):
                 row[bench_set] = f"{run['summary']['test_wer'][split]:.2f}†"
@@ -273,15 +311,16 @@ def print_table(all_runs=False):
     if all_runs:
         for tag, summary in results.items():
             if summary.get("_model", "").startswith("mel:") and tag not in best_result_tags:
-                rows[tag] = {k: v["wer"] for k, v in summary.items() if k in SETS}
+                rows[tag] = {k: v["wer"] for k, v in summary.items() if k in ALL_SETS}
 
-    cols = [s for s in OPENASR_SETS if any(s in r for r in rows.values())]
-    print("| model | " + " | ".join(cols) + " | avg (cols present) |")
+    cols = [s for s in ALL_SETS if any(s in r for r in rows.values())]
+    avg_cols = [c for c in cols if c in OPENASR_SETS]  # local extra sets are shown but not averaged
+    print("| model | " + " | ".join(cols) + " | OpenASR avg (cols present) |")
     print("|---" * (len(cols) + 2) + "|")
     for name, r in rows.items():
         vals = [r.get(c) for c in cols]
-        have = [v for v in vals if isinstance(v, (int, float))]
-        avg = f"{sum(have) / len(have):.2f}" if len(have) == len(cols) else "–"
+        have = [r.get(c) for c in avg_cols if isinstance(r.get(c), (int, float))]
+        avg = f"{sum(have) / len(have):.2f}" if have and len(have) == len(avg_cols) else "–"
         cells = ["–" if v is None else v if isinstance(v, str) else f"{v:.2f}" for v in vals]
         print(f"| {name} | " + " | ".join(cells) + f" | {avg} |")
     if any(isinstance(v, str) for r in rows.values() for v in r.values()):
@@ -329,13 +368,18 @@ def print_table(all_runs=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model", nargs="?", help="mel:<run_dir> or hf:<model_id>")
-    ap.add_argument("--sets", nargs="+", default=["all"], help=f"subset of {list(SETS)} or 'all'")
+    ap.add_argument("--sets", nargs="+", default=["all"],
+                    help=f"subset of {ALL_SETS}, 'openasr' (leaderboard 7) or 'all' (leaderboard + local test sets)")
     ap.add_argument("--limit", type=int, default=None, help="evaluate N evenly spaced utterances per set (smoke test)")
     ap.add_argument("--batch_size", type=int, default=None)
     ap.add_argument("--tag", default=None, help="results/<tag> (default derived from model)")
     ap.add_argument("--table", action="store_true",
                     help="print the results table (best run per base LLM + its config) and exit")
     ap.add_argument("--all_runs", action="store_true", help="with --table: also list non-best mel: results")
+    decode = ap.add_argument_group("mel: decoding overrides (default: the run's config.json, else train.py defaults)")
+    decode.add_argument("--max_new_tokens", type=int, default=None)
+    decode.add_argument("--max_tokens_per_sec", type=float, default=None, help="per-utterance cap, 0 = off")
+    decode.add_argument("--no_repeat_ngram_size", type=int, default=None, help="0 = off")
     args = ap.parse_args()
 
     if args.table:
@@ -345,9 +389,16 @@ def main():
     sets = resolve_sets(args.sets)
 
     model, tag = load_model(args.model, args.batch_size)
-    tag = args.tag or tag + (f"_limit{args.limit}" if args.limit else "")
-    benchmark(model, tag, sets, args.limit, log=lambda msg: print(msg, flush=True), spec=args.model)
-    if model.run_dir and not args.limit:
+    overrides = {key: getattr(args, key.lower()) for key in DECODE_KEYS if getattr(args, key.lower()) is not None}
+    if overrides and not model.run_dir:
+        ap.error("decoding overrides only apply to mel: models")
+    for key, val in overrides.items():
+        setattr(model.t, key, val)
+    decode_suffix = "".join(f"_{key.lower()}{val:g}" for key, val in overrides.items())
+    tag = args.tag or tag + decode_suffix + (f"_limit{args.limit}" if args.limit else "")
+    benchmark(model, tag, sets, args.limit, log=lambda msg: print(msg, flush=True), spec=args.model,
+              track=not overrides)
+    if model.run_dir and not args.limit and not overrides:
         import runs as runs_lib
         runs_lib.refresh_run_views(model.run_dir)
     print_table()
