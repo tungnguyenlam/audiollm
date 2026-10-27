@@ -69,12 +69,42 @@ VAL_FROM_TRAIN = False       # validate on the training utterances themselves (f
 EVAL_AUDIO_ABLATIONS = ""    # comma list of extra decodes per val pass to test audio dependence: "shuffle" (each utt gets its batch neighbour's audio), "zeros" (all-zero mel); logged as wer_<ablation>
 
 # Audio feature extraction configuration
-SR = 16000                   # Target audio sample rate (Hz)
-N_FFT = 400                  # STFT window size (400 samples = 25 ms at 16 kHz)
-HOP = 160                    # STFT hop size (160 samples = 10 ms at 16 kHz -> 100 frames/s)
-N_MELS = 80                  # Number of mel filterbank channels
-MVN_N = 2000                 # Number of utterances sampled to compute dataset Mean-Variance Normalization stats
-STACK = 16                   # Mel frames stacked per audio token: 16 -> 1280-d patch (>= 230M hidden 1024) at 100/16 = 6.25 Hz (8 = paper's 12.5 Hz)
+# ------------------------------------------------------------------------------------------------
+# SR: Sampling rate of input audio waveforms in Hz.
+#   - 16 kHz audio captures frequencies up to 8 kHz (Nyquist), covering all fundamental frequencies
+#     and critical formant/fricative acoustic cues for human speech. LibriSpeech/AMI/FLEURS standard.
+SR = 16000
+
+# N_FFT: Short-Time Fourier Transform (STFT) window length in samples.
+#   - 400 samples = 25.0 ms window (N_FFT / SR). Fits the quasi-stationary assumption of human speech (vocal tract shape is steady over ~20-30 ms), balancing frequency resolution against temporal blurring.
+#   - Yields N_FFT // 2 + 1 = 201 linear frequency bins spanning 0 to SR/2 (8 kHz) (~39.8 Hz/bin).
+N_FFT = 400
+
+# HOP: STFT hop length (stride between successive analysis windows) in samples.
+#   - 160 samples = 10.0 ms frame shift (HOP / SR), giving an STFT frame rate of SR / HOP = 100 Hz.
+#   - Overlap = (1 - HOP / N_FFT) = 60%, providing smooth temporal transitions without framing artifacts.
+HOP = 160
+
+# N_MELS: Number of triangular bandpass filters in the Mel-scale filterbank.
+#   - Projects 201 linear STFT bins to 80 perceptually warped frequency channels (denser in low frequencies,
+#     log-spaced in high frequencies, matching human cochlear frequency selectivity).
+#   - Standard in modern ASR (Whisper, Conformer, Mel-LLM). (Higher, e.g. 128 at N_FFT=400, risks dead filter bins).
+N_MELS = 80
+
+# MVN_N: Number of training utterances randomly sampled to compute global Mean-Variance Normalization stats.
+#   - Samples MVN_N utterances across the training set to derive per-channel mean and std vectors (shape: 80,).
+#   - Applied as (mel - mean) / std to zero-center features and scale variance to 1, stabilizing initial gradients.
+#   - Cached to disk based on split, MVN_N, SR, N_FFT, HOP, and N_MELS.
+MVN_N = 2000
+
+# STACK: Number of consecutive 10 ms mel frames grouped into a single audio patch/token for the LLM.
+#   - Patch dimension: STACK * N_MELS (e.g. 16 * 80 = 1280-d input vector to Linear/MLP projector; or downsampled
+#     by log2(STACK) = 4 strided Conv1d stages in Conv projector).
+#   - Effective audio token rate: (SR / HOP) / STACK = 100 / 16 = 6.25 tokens/s (1 token per 160 ms).
+#   - Trade-off: STACK=8 yields 12.5 Hz (paper default, finer phonetic resolution, 2x longer LLM sequence length),
+#     whereas STACK=16 halves sequence length and compute while yielding 1280-d patches (>= 230M LLM hidden dim 1024).
+STACK = 16
+# ------------------------------------------------------------------------------------------------
 
 # Model and optimization hyperparameters
 PROMPT = "Transcription:"    # Text prompt prepended to transcriptions
