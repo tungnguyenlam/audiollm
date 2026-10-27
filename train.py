@@ -105,7 +105,7 @@ EVAL_BATCH_SIZE = 16         # Evaluation batch size
 MAX_NEW_TOKENS = 256         # Hard cap on generated tokens during evaluation (pre-2026-10-27 runs: 200)
 MAX_TOKENS_PER_SEC = 6.0     # Per-utterance decode cap: ceil(MAX_TOKENS_PER_SEC * sec) + MAX_TOKENS_PAD tokens (0 = only MAX_NEW_TOKENS); no train transcript exceeds 6*sec+10
 MAX_TOKENS_PAD = 10          # Constant slack added to the per-utterance cap
-NO_REPEAT_NGRAM_SIZE = 0     # >0: forbid repeating any n-gram of this size in a hypothesis (HF generate); 0 = off
+NO_REPEAT_NGRAM_SIZE = 4     # >0: forbid repeating any n-gram of this size in a hypothesis (HF generate); 0 = off (pre-2026-10-27 runs). 4 won the decode A/B (WORKLOG)
 NUM_WORKERS = 8              # Number of DataLoader worker processes
 LOG_N_EXAMPLES = 2           # Number of (ref, hyp) examples printed after each validation pass
 PLOT_EVERY = 100             # Re-draw runs/<id>/plots.png (+ runs/INDEX.md) every N optimizer steps and after each val

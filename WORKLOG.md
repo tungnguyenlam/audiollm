@@ -131,3 +131,34 @@ Earlier months: `docs/worklog_archive/YYYY-MM.md`.
   N_FFT=512 5.29 | HOP=320/N_FFT=640/STACK=8 5.72 | N_MELS=40/STACK=32 6.43 (audio/text 1.02: too few tokens) |
   SR=8000 9.96. STACK=8 = same info, 4.05 audio/text, 1.65x LLM cost. Proxies only, not WER.
 - Caveat: `extract_log_mel_spectrogram` asserts file SR == SR, so SR != 16000 is not trainable without a resample step.
+
+## 2026-10-27 - Decode A/B: per-utterance token cap + no-repeat-4-gram become defaults
+
+- Added `MAX_TOKENS_PER_SEC=6.0` + `MAX_TOKENS_PAD=10` (per-utt cap; no train transcript exceeds `6*sec+10`),
+  `NO_REPEAT_NGRAM_SIZE`, `MAX_NEW_TOKENS` 200 -> 256; shared `generate_transcripts()` for train eval + benchmark.
+  `benchmark.py` now reports sub/del/ins and takes `--max_tokens_per_sec/--no_repeat_ngram_size/--max_new_tokens`.
+- A/B on `mix544h_conv_stack8`, 400 evenly spaced utts/set (`results/decab_*`), WER:
+
+  | cfg | ls_c | ls_o | vox | ami | earn22 | giga | spgi | fleurs | edacc | mean9 |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | old (200 tok) | 71.5 | 88.5 | 114.0 | 96.0 | 207.6 | 107.6 | 145.2 | 134.7 | 130.5 | 121.7 |
+  | cap6 | 71.5 | 87.5 | 109.5 | 78.4 | 140.1 | 96.5 | 119.0 | 117.2 | 109.9 | 103.3 |
+  | cap6+nr3 | 71.8 | 87.5 | 104.5 | 76.0 | 112.7 | 92.7 | 109.5 | 106.7 | 96.2 | 95.3 |
+  | cap6+nr4 | 71.6 | 87.3 | 104.7 | 74.7 | 113.7 | 92.7 | 109.8 | 107.4 | 96.2 | 95.3 |
+  | cap6+nr6 | 71.5 | 87.4 | 105.0 | 74.8 | 115.5 | 92.8 | 111.4 | 107.8 | 97.1 | 95.9 |
+- Decision: default `NO_REPEAT_NGRAM_SIZE=4` (ties nr3 on mean, better on LS/AMI, safer for real 3-gram repeats).
+  Decoding is inference-only so old run configs pick up the new defaults; old full results moved to
+  `results/mel_20261027-150147_mix544h_conv_stack8_maxnew200/`. LibriSpeech unchanged: the fix removes loop
+  insertions only; OOD sets stay ~93-114% (real acoustic generalisation gap).
+
+## 2026-10-27 - Queue: re-benchmark + warm-start continuation + rebalanced mix + 100 h ablation
+
+- Added `INIT_FROM` (warm-start LoRA + projector, fresh optimizer/schedule; checks arch keys, inherits the init run's
+  MVN via new `MVN_SPLIT`), `"<split>*K"` weights in `TRAIN_SPLIT`, `TRAIN_STEPS` (fixed budget). Smoke: warm start
+  resumes at loss 1.54 (parent ended ~1.47), 15.5M trainable LoRA params.
+- `results/queue_20261027.sh` (log `results/queue_20261027.log`), sequential:
+  1. full 9-set re-benchmark of `mix544h_conv_stack8` with cap6+nr4 decoding;
+  2. `mix544h_conv_stack8_cont19k`: init from it, same mix, 19.2k steps, lr 1e-4 (proj x2.5), warmup 300, cosine -> 0.1;
+  3. `mix654h_rebal_conv_stack8_cont19k`: same budget, `ami_ihm/train*2+fleurs_en/train*6` (654 h/epoch);
+  4. `ls100h_conv_stack8_12768`: cold start, train-clean-100 only, same 12,768-step schedule as the 544 h run.
+- 2 vs 3 isolates data balance at equal steps; 4 vs `mix544h_conv_stack8` isolates data volume for the conv projector.

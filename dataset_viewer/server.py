@@ -15,6 +15,7 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from dataset_viewer import frontend_lab
 from dataset_viewer.audio import THRESHOLDS, compute_metrics, linear_spec_db, log_mel, render_png
 from dataset_viewer.sources import discover
 from dataset_viewer.store import DATASET_DECISIONS, METRIC_FIELDS, SAMPLE_STATUSES, Store
@@ -32,6 +33,7 @@ def create_app(data_root="data", db_path="data/curation.sqlite3", scan_workers=4
     scans = {}  # dataset_id -> ScanJob
     audio_cache = OrderedDict()
     audio_lock = threading.Lock()
+    lab_cache = OrderedDict()  # key -> {name: bytes} of the last front-end lab results
     app = FastAPI(title="Audio dataset viewer")
 
     # ---- helpers -------------------------------------------------------------------------------------------
@@ -246,6 +248,41 @@ def create_app(data_root="data", db_path="data/curation.sqlite3", scan_workers=4
             png, fmax = render_png(linear_spec_db(x, sr), cmap, dynamic_range=90), sr / 2
         return Response(png, media_type="image/png",
                         headers={"X-Freq-Max": str(fmax), "Cache-Control": "max-age=3600"})
+
+    # ---- API: front-end lab --------------------------------------------------------------------------------
+    @app.get("/api/lab/presets")
+    def lab_presets():
+        return {"presets": frontend_lab.PRESETS, "feature_precisions": frontend_lab.FEATURE_PRECISIONS,
+                "max_sec": frontend_lab.MAX_SEC}
+
+    @app.get("/api/lab")
+    def lab(ds: str, idx: int, sr: int = 16000, bits: int = 32, quant: str = "pcm", n_fft: int = 400, hop: int = 160,
+            n_mels: int = 80, stack: int = 16, feat: str = "fp32", start: float = 0.0, dur: float = 8.0,
+            hidden: int = 1024):
+        """Resample / quantise / featurise one clip with the given front-end and return plots, scores and audio."""
+        d = get_ds(ds)
+        check_idx(d, idx)
+        p = frontend_lab.validate(dict(sr=sr, bits=bits, quant=quant, n_fft=n_fft, hop=hop, n_mels=n_mels,
+                                       stack=stack, feat=feat, start=start, dur=dur))
+        key = f"{len(lab_cache)}-{time.time_ns()}"
+        x, x_sr, _ = load_audio(d, idx)
+        try:
+            summary, files = frontend_lab.analyse(x, x_sr, p, hidden_size=hidden)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        with audio_lock:
+            lab_cache[key] = files
+            while len(lab_cache) > 12:
+                lab_cache.popitem(last=False)
+        return summary | {"key": key, "files": sorted(files)}
+
+    @app.get("/api/lab/file")
+    def lab_file(key: str, name: str):
+        files = lab_cache.get(key)
+        if files is None or name not in files:
+            raise HTTPException(404, "lab result expired; run it again")
+        kind = "image/png" if name.startswith("img_") else "audio/wav" if name.startswith("wav_") else "application/octet-stream"
+        return Response(files[name], media_type=kind, headers={"Cache-Control": "max-age=3600"})
 
     @app.put("/api/review")
     def review(ds: str, idx: int, body: dict = Body(...)):
