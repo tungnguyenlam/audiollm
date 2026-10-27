@@ -196,3 +196,19 @@ Earlier months: `docs/worklog_archive/YYYY-MM.md`.
   values are marked against `train.py` with derived numbers that update instantly. Light and dark themes, phone width.
 - Verified with headless Chromium: settings clicks, typing, rapid changes, presets, reset and audio after a change
   (fetched for the new settings key); review next/flag/clear; report tiles and histograms; no console errors.
+
+## 2026-10-28 - Notebooks: explore_pipeline reorganised, new projector_anatomy.ipynb
+- `explore_pipeline.ipynb` updated to the current setup: loads the `TRAIN_SPLIT` mix via `T.load_split` (it still
+  assumed train-clean-100 only), builds any `PROJECTOR` via `T.build_audio_projector` (was hard-coded `nn.Linear`, so
+  conv runs failed to load), and matches runs on `PROJECTOR` too (missing key in old configs = default). Front-end sweep
+  moved before the projector (now §4), projector §5. §7 (LLM decode) is skipped on CPU: LFM2's short-conv kernel is
+  CUDA-only. Verified with Run All on CPU for default (linear/stack16) and conv/stack8.
+- New `projector_anatomy.ipynb`: follows one audio token through the conv projector (family tree / receptive field,
+  per-layer activations, exact Jacobian, occlusion, whole-utterance influence map, nearest vocab, conv1 kernels).
+  Findings on `mix544h_conv_stack8`, dev-clean[10], token 47:
+  - Receptive field = 15 frames: the token's own patch + the previous patch's last 7 frames; ~45% of its sensitivity
+    comes from the previous patch. Per-frame sensitivity follows the stride-2 tree's 1-3-path comb.
+  - Sparse units: ~9-15% active after conv2 / conv3 / fc1.
+  - Audio tokens have median norm ~40 vs ~0.9 for text embeddings (44x; init `match_emb` was ~0.8), and cosine
+    ~0.1-0.15 to their nearest vocab entry: a separate region of embedding space. Candidate experiment: norm
+    penalty or an output LayerNorm on the projector.
