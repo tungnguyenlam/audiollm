@@ -122,7 +122,7 @@ with a flag, and the resolved values are saved in each run's `config.json`.
 | projector | single `nn.Linear`, random init | |
 | LLM | LFM2.5-230M-Base, bf16, frozen + LoRA r64/α128 (`LORA_TARGETS=all-linear`: conv `in_proj`/`out_proj`, attn `q/k/v/out_proj`, MLP `w1/w2/w3`; not embeddings/`lm_head`) | no quantization; 2.6B-Base for paper-scale runs |
 | precision | `PRECISION=bf16`: LoRA + projector weights, grads and AdamW states all bf16 | `amp` = fp32 master weights + bf16 autocast; `fp32` = runs before 2026-10-27 (fp32 LoRA/projector, ~1.65x slower/step) |
-| optim | AdamW lr 1e-4, 200 warmup → linear decay, clip 1.0, eff. batch 32, 2 epochs | paper's lr/clip |
+| optim | AdamW lr 1e-4, 200 warmup → cosine decay (`--lr_schedule linear` for the old schedule), clip 1.0, eff. batch 32, 2 epochs; `--optimizer muon` = `torch.optim.Muon` on every trainable 2D weight (LoRA A/B + projector weight), no AdamW at all (projector bias frozen), `--muon_adjust_lr match_rms_adamw` so the AdamW lr/wd carry over | paper's lr/clip |
 | decode | greedy, batched left-pad, max 200 new tokens | |
 | WER | lowercase, keep `[a-z' ]`, corpus-level jiwer | |
 

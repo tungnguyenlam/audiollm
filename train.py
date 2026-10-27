@@ -50,13 +50,13 @@ import runs as runs_lib
 
 # ---------------------------------------------------------------- config
 RUN_NAME = ""                # run directory suffix; empty = auto "<model>_stack<STACK>" (e.g. LFM2.5-230M-Base_stack16)
-SEED = 0
+SEED = 0                     # Random seed for reproducibility
 MODEL = "LiquidAI/LFM2.5-230M-Base"  # small model for fast experiments (2.6B-Base is the paper-scale target)
-DATA = "data/LibriSpeech"
-TRAIN_SPLIT = "train-clean-100"
-VAL_SPLIT = "dev-clean"
+DATA = "data/LibriSpeech"    # Path to dataset directory
+TRAIN_SPLIT = "train-clean-100"  # Training dataset split
+VAL_SPLIT = "dev-clean"      # Validation dataset split
 VAL_N = 200                  # fixed dev subset used for in-training WER
-TEST_SPLITS = ["test-clean", "test-other"]
+TEST_SPLITS = ["test-clean", "test-other"]  # Test dataset splits
 MAX_TRAIN_SEC = 30.0         # drop the few very long utterances
 
 # Audio feature extraction configuration
@@ -68,35 +68,40 @@ MVN_N = 2000                 # Number of utterances sampled to compute dataset M
 STACK = 16                   # Mel frames stacked per audio token: 16 -> 1280-d patch (>= 230M hidden 1024) at 100/16 = 6.25 Hz (8 = paper's 12.5 Hz)
 
 # Model and optimization hyperparameters
-PROMPT = "Transcription:"
-LORA_R = 64
-LORA_ALPHA = 128
-LORA_DROPOUT = 0.05
+PROMPT = "Transcription:"    # Text prompt prepended to transcriptions
+LORA_R = 64                  # LoRA rank dimension
+LORA_ALPHA = 128             # LoRA scaling factor (alpha)
+LORA_DROPOUT = 0.05          # LoRA dropout probability
 LORA_TARGETS = "all-linear"  # LLM modules that get LoRA (projector is always fully trained): "all-linear" (PEFT: every nn.Linear in the LLM blocks, i.e. attn q/k/v/out_proj + conv in/out_proj + MLP w1/w2/w3, not lm_head/embeddings) or a comma list e.g. "q_proj,k_proj,v_proj,out_proj"
-LR = 1e-4                    # Peak learning rate: 1e-4 with linear warmup and decay
-WEIGHT_DECAY = 0.0
-WARMUP_STEPS = 200
-EPOCHS = 2
-BATCH_SIZE = 8
+LR = 1e-4                    # Peak learning rate: 1e-4, reached after linear warmup, then decayed per LR_SCHEDULE
+LR_SCHEDULE = "cosine"       # Decay after warmup: "cosine" (half-cosine annealing to MIN_LR_RATIO * LR) | "linear" (to 0, pre-2026-10-27 runs)
+MIN_LR_RATIO = 0.0           # Cosine floor as a fraction of LR (e.g. 0.1 -> anneal to 1e-5)
+WEIGHT_DECAY = 0.0           # Weight decay for optimizer
+OPTIMIZER = "adamw"          # "adamw" (all trainable params) | "muon" (torch.optim.Muon on every trainable 2D linear weight = LoRA A/B + projector weight; no AdamW anywhere, so the projector bias is frozen at init; the LLM's depthwise conv is frozen either way)
+MUON_ADJUST_LR = "match_rms_adamw"  # Muon per-matrix lr scaling: "match_rms_adamw" (update RMS ~ AdamW's, so LR/WEIGHT_DECAY transfer from AdamW) | "original" (Keller Jordan's sqrt(max(1, A/B)); wants LR ~ 0.02)
+WARMUP_STEPS = 200           # Linear learning rate warmup steps
+EPOCHS = 2                   # Total number of training epochs
+BATCH_SIZE = 8               # Training batch size per device
 GRAD_ACCUM = 4               # Gradient accumulation steps -> effective batch size = 8 * 4 = 32
-GRAD_CLIP = 1.0
+GRAD_CLIP = 1.0              # Maximum gradient norm clipping threshold
 GRAD_CKPT = True             # Enable gradient checkpointing to reduce VRAM
-LOG_EVERY = 20
+LOG_EVERY = 20               # Step interval for logging training progress
 EVAL_EVERY = 500             # Evaluate on validation split every N optimizer steps
-EVAL_BATCH_SIZE = 16
-MAX_NEW_TOKENS = 200
-NUM_WORKERS = 8
+EVAL_BATCH_SIZE = 16         # Evaluation batch size
+MAX_NEW_TOKENS = 200         # Maximum generated tokens during evaluation
+NUM_WORKERS = 8              # Number of DataLoader worker processes
 LOG_N_EXAMPLES = 2           # Number of (ref, hyp) examples printed after each validation pass
 PLOT_EVERY = 100             # Re-draw runs/<id>/plots.png (+ runs/INDEX.md) every N optimizer steps and after each val
 BENCHMARK_SETS = "all"       # After training + test eval, run benchmark.py on these Open ASR sets with the in-memory model: "all", comma list (e.g. "librispeech_clean,ami") or "none"
 
-DEVICE = "cuda"
-DTYPE = torch.bfloat16
+DEVICE = "cuda"              # Compute device (cuda or cpu)
+DTYPE = torch.bfloat16       # Base model torch dtype
 PRECISION = "bf16"           # bf16: LoRA+proj weights/grads/AdamW states in DTYPE (fastest) | amp: fp32 master weights + DTYPE autocast | fp32: fp32 LoRA+proj, no autocast (pre-2026-10-27 runs)
 
 
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 PRECISIONS = ("bf16", "amp", "fp32")  # tuple, so it is not picked up as a config constant
+OPTIMIZERS = ("adamw", "muon")
 
 
 def get_config_dictionary():
@@ -164,7 +169,12 @@ def build_arg_parser():
     hparam_group = parser.add_argument_group("config (defaults = UPPERCASE constants at the top of train.py)")
     comments = read_constant_comments()
     for key, default in DEFAULT_CONFIG.items():
-        kwargs = {"dest": key, "default": default, "help": comments.get(key, " ").replace("%", "%%")}
+        help_text = comments.get(key)
+        kwargs = {
+            "dest": key,
+            "default": default,
+            "help": help_text.replace("%", "%%") if help_text else "(default: %(default)s)",
+        }
         if isinstance(default, bool):
             kwargs["action"] = argparse.BooleanOptionalAction
         elif isinstance(default, list):
@@ -173,6 +183,8 @@ def build_arg_parser():
             kwargs["choices"] = list(DTYPES)
         elif key == "PRECISION":
             kwargs["choices"] = PRECISIONS
+        elif key == "OPTIMIZER":
+            kwargs["choices"] = OPTIMIZERS
         else:
             kwargs["type"] = type(default)
         hparam_group.add_argument("--" + key.lower(), **kwargs)
@@ -873,6 +885,7 @@ def override_name_suffix(config):
     """
     short = {"BATCH_SIZE": "bs", "GRAD_ACCUM": "ga", "LORA_R": "r", "LORA_ALPHA": "a", "LORA_DROPOUT": "ldrop",
              "LORA_TARGETS": "lora", "WARMUP_STEPS": "warmup", "WEIGHT_DECAY": "wd", "GRAD_CLIP": "clip",
+             "LR_SCHEDULE": "sched", "MIN_LR_RATIO": "minlr", "OPTIMIZER": "opt", "MUON_ADJUST_LR": "muonlr",
              "TRAIN_SPLIT": "train", "PRECISION": "prec", "MAX_TRAIN_SEC": "maxsec"}
     skip = runs_lib.IGNORED_KEYS | {"MODEL", "STACK", "EVAL_EVERY", "VAL_N", "TEST_SPLITS", "DATA", "MAX_NEW_TOKENS"}
     parts = []
@@ -897,7 +910,7 @@ def train(args, run_dir, tracker, log_and_print):
     total_train_hours = sum(item["sec"] for item in train_items) / 3600.0
     log_and_print(f"train utts {len(train_items)} ({total_train_hours:.1f} h), val utts {len(validation_items)}")
     log_and_print(
-        f"batch {BATCH_SIZE} x accum {GRAD_ACCUM} = {BATCH_SIZE * GRAD_ACCUM} | lr {LR:.1e} warmup {WARMUP_STEPS} "
+        f"batch {BATCH_SIZE} x accum {GRAD_ACCUM} = {BATCH_SIZE * GRAD_ACCUM} | {OPTIMIZER} lr {LR:.1e} {LR_SCHEDULE} warmup {WARMUP_STEPS} "
         f"| epochs {EPOCHS} | stack {STACK} ({SR / HOP / STACK:.2f} Hz audio tokens, {STACK * N_MELS}-d patches) | lora r{LORA_R} a{LORA_ALPHA} on LLM {LORA_TARGETS}"
     )
 
@@ -907,9 +920,13 @@ def train(args, run_dir, tracker, log_and_print):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.train()
 
+    # Muon only takes 2D matrices and nothing falls back to AdamW, so the (1D) projector bias stays at its init
+    if OPTIMIZER == "muon":
+        audio_projector.bias.requires_grad_(False)
+
     # Collect trainable parameters (LoRA adapter weights + linear projector)
     trainable_lora_params = [param for param in model.parameters() if param.requires_grad]
-    all_trainable_params = trainable_lora_params + list(audio_projector.parameters())
+    all_trainable_params = trainable_lora_params + [p for p in audio_projector.parameters() if p.requires_grad]
 
     lora_param_count_m = sum(param.numel() for param in trainable_lora_params) / 1e6
     proj_param_count_m = sum(param.numel() for param in audio_projector.parameters()) / 1e6
@@ -917,17 +934,28 @@ def train(args, run_dir, tracker, log_and_print):
                   f"({sorted({str(p.dtype).removeprefix('torch.') for p in all_trainable_params})})")
     log_and_print(describe_lora_placement(model))
 
-    optimizer = torch.optim.AdamW(all_trainable_params, lr=LR, weight_decay=WEIGHT_DECAY, betas=(0.9, 0.999))
+    if OPTIMIZER == "adamw":
+        optimizer = torch.optim.AdamW(all_trainable_params, lr=LR, weight_decay=WEIGHT_DECAY, betas=(0.9, 0.999))
+    elif OPTIMIZER == "muon":
+        optimizer = torch.optim.Muon(all_trainable_params, lr=LR, weight_decay=WEIGHT_DECAY, adjust_lr_fn=MUON_ADJUST_LR)
+        log_and_print(f"optimizer: Muon ({MUON_ADJUST_LR}) on all {len(all_trainable_params)} trainable 2D weights, "
+                      "no AdamW (projector bias frozen)")
+    else:
+        raise ValueError(f"unknown OPTIMIZER {OPTIMIZER!r} (expected 'adamw' or 'muon')")
 
-    # Calculate steps and linear learning rate schedule with warmup
+    # Calculate steps and learning rate schedule: linear warmup, then cosine or linear decay
     steps_per_epoch = math.ceil(len(train_items) / BATCH_SIZE) // GRAD_ACCUM
     total_optimizer_steps = args.max_steps or (steps_per_epoch * EPOCHS)
 
     def compute_lr_multiplier(step_idx):
         if step_idx < WARMUP_STEPS:
             return (step_idx + 1) / WARMUP_STEPS
-        remaining_ratio = (total_optimizer_steps - step_idx) / max(1, total_optimizer_steps - WARMUP_STEPS)
-        return max(0.0, remaining_ratio)
+        decay_progress = min(1.0, (step_idx - WARMUP_STEPS) / max(1, total_optimizer_steps - WARMUP_STEPS))
+        if LR_SCHEDULE == "cosine":
+            return MIN_LR_RATIO + (1.0 - MIN_LR_RATIO) * 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+        if LR_SCHEDULE == "linear":
+            return 1.0 - decay_progress
+        raise ValueError(f"unknown LR_SCHEDULE {LR_SCHEDULE!r} (expected 'cosine' or 'linear')")
 
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=compute_lr_multiplier)
     log_and_print(f"steps/epoch {steps_per_epoch}, total steps {total_optimizer_steps}")
