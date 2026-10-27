@@ -93,11 +93,11 @@ the registry. The default set (≈ 58 GB, keeping `data/` ≤ 100 GB) adds:
 ### Dataset viewer (quality check before pretraining)
 
 ```bash
-python -m dataset_viewer            # http://127.0.0.1:8765  (--port, --data, --db)
+.venv/bin/python -m dataset_viewer  # http://127.0.0.1:8765  (--port, --data, --db)
 ```
 
 A local web page over everything in `data/`. Each corpus split is a separate dataset (37 at the moment).
-- **Inspect samples**: play the audio (speed, gain, loop a dragged region), with the waveform (clipped samples in
+- **Review samples**: play the audio (speed, gain, loop a dragged region), with the waveform (clipped samples in
   red) and the spectrogram. The spectrogram has two views: the *model view* (16 kHz HTK log-mel 80 that `train.py`
   computes) and a *linear STFT at the native rate*, which shows the file's true bandwidth. The page also shows the
   transcript/labels, every metadata column, and signal metrics with automatic flags. You mark each sample
@@ -105,6 +105,10 @@ A local web page over everything in `data/`. Each corpus split is a separate dat
 - **Quality report**: scans a random subset (or the whole split) and shows histograms, percentiles and
   flag rates (clipping, low SNR, narrowband, mostly silent, quiet, text rate too fast or too slow, …). From there you
   can open the worst rows in the inspector, or bulk-reject every row that has a given flag.
+- **Front-end lab**: runs the open sample through resample → quantise → STFT → mel → log → feature precision →
+  MVN → stack with any `SR / BITS / N_FFT / HOP / N_MELS / STACK` and precision. Results update as you change a
+  setting; values that differ from `train.py` are marked, and the derived numbers (window and hop in ms, token rate,
+  patch size) update instantly. You can listen to every stage and inspect single tokens.
 - **Decision per dataset**: *Include / Exclude / Undecided* for pretraining, with a note.
 
 State is kept in `data/curation.sqlite3`. **Export curation manifest** (sidebar) writes JSON that lists, for each

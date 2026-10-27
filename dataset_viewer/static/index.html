@@ -2,239 +2,316 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Dataset Viewer · audiollm</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dataset Viewer · audiollm</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="/static/style.css">
+<script type="module" src="/static/js/main.js"></script>
 </head>
 <body>
-<div id="app">
+<div class="app">
 
-  <!-- ============ Datasets sidebar ============ -->
-  <aside id="sidebar">
-    <div class="brand">Dataset Viewer <span class="dim">audiollm</span></div>
-    <input id="ds-filter" type="search" placeholder="Filter datasets…">
-    <div id="ds-list"></div>
-    <div class="sidebar-foot">
-      <a class="btn wide" href="/api/export/manifest" title="Per-dataset include/exclude + rejected sample keys">Export curation manifest</a>
-      <div class="legend">
-        <span><i class="dot include"></i>include</span>
-        <span><i class="dot exclude"></i>exclude</span>
-        <span><i class="dot undecided"></i>undecided</span>
-      </div>
+  <!-- ================= datasets ================= -->
+  <aside class="rail" id="rail">
+    <div class="rail-head">
+      <div class="brand">Dataset Viewer<span>audiollm</span></div>
+      <input id="ds-filter" type="search" placeholder="Find a dataset" aria-label="Find a dataset">
+    </div>
+    <nav id="ds-list" class="ds-list" aria-label="Datasets"></nav>
+    <div class="rail-foot">
+      <a class="btn block" href="/api/export/manifest" title="Per-dataset include / exclude plus every rejected and flagged sample key">Export curation manifest</a>
+      <div class="legend"><span><i class="dot include"></i>include</span><span><i class="dot exclude"></i>exclude</span><span><i class="dot undecided"></i>undecided</span></div>
     </div>
   </aside>
 
-  <!-- ============ Main ============ -->
-  <main id="main">
-    <header id="ds-header">
+  <main class="main">
+    <!-- ================= dataset header ================= -->
+    <header class="ds-head">
+      <button id="rail-toggle" class="icon-btn rail-toggle" aria-label="Show datasets">☰</button>
       <div class="ds-title">
-        <h1 id="ds-name">–</h1>
-        <div id="ds-sub" class="dim"></div>
+        <h1 id="ds-name">Loading…</h1>
+        <div id="ds-sub" class="muted"></div>
       </div>
       <div class="ds-decision">
-        <span class="dim small">Use for pretraining?</span>
-        <div class="seg" id="decision-seg">
-          <button data-v="include">Include</button>
-          <button data-v="undecided">Undecided</button>
-          <button data-v="exclude">Exclude</button>
+        <span class="eyebrow">Use for training</span>
+        <div class="seg" id="decision-seg" role="radiogroup" aria-label="Use this dataset for training">
+          <button data-v="include" role="radio">Include</button>
+          <button data-v="undecided" role="radio">Undecided</button>
+          <button data-v="exclude" role="radio">Exclude</button>
         </div>
-        <input id="decision-note" placeholder="Why? (saved on blur)">
+        <input id="decision-note" placeholder="Why? Saved when you leave the field" aria-label="Decision note">
       </div>
-      <nav class="tabs" id="tabs">
-        <button data-tab="inspect" class="active">Inspect samples</button>
-        <button data-tab="report">Quality report</button>
+      <nav class="views" id="views" role="tablist">
+        <button data-view="review" role="tab">Review samples</button>
+        <button data-view="report" role="tab">Quality report</button>
+        <button data-view="lab" role="tab">Front-end lab</button>
+        <span class="views-end">
+          <button id="help-btn" class="icon-btn" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">?</button>
+          <button id="theme-btn" class="icon-btn" aria-label="Switch light / dark" title="Switch light / dark"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1.5a6.5 6.5 0 0 1 0 13z" fill="currentColor"/></svg></button>
+        </span>
       </nav>
     </header>
 
-    <!-- ===== Inspect tab ===== -->
-    <section id="tab-inspect" class="tab">
-      <div id="list-pane">
-        <div class="filters">
-          <input id="f-q" type="search" placeholder="Search id / label text…">
-          <div class="row">
-            <select id="f-status" title="Review status">
-              <option value="all">All statuses</option>
+    <!-- ================= review ================= -->
+    <section id="view-review" class="view review" hidden>
+      <aside class="list-pane">
+        <div class="list-tools">
+          <input id="f-q" type="search" placeholder="Search id, key or label text" aria-label="Search samples">
+          <div class="pair">
+            <select id="f-status" aria-label="Review status">
+              <option value="all">Any status</option>
               <option value="unreviewed">Unreviewed</option>
               <option value="keep">Kept</option>
               <option value="reject">Rejected</option>
               <option value="flag">Flagged</option>
             </select>
-            <select id="f-flag" title="Automatic quality flags (need a scan)">
-              <option value="all">All rows</option>
-              <option value="scanned">Scanned</option>
-              <option value="unscanned">Not scanned</option>
-              <option value="any">Any auto-flag</option>
-              <option value="none">No auto-flag</option>
-            </select>
+            <select id="f-flag" aria-label="Automatic checks"></select>
           </div>
-          <div class="row">
-            <select id="f-sort" title="Sorting by a metric only shows scanned rows"></select>
-            <button id="f-desc" class="btn icon" title="Toggle ascending / descending">↑</button>
-            <button id="f-shuffle" class="btn icon" title="Random order (new shuffle)">⤨</button>
+          <div class="pair">
+            <select id="f-sort" aria-label="Order"></select>
+            <button id="f-desc" class="btn" title="Reverse the order">↑ Asc</button>
           </div>
-          <div class="row between">
-            <span id="list-count" class="dim small"></span>
-            <button id="bulk-btn" class="btn small" title="Apply a status to every row matching this filter">Bulk…</button>
+          <div class="list-meta">
+            <span id="list-count" class="muted"></span>
+            <button id="bulk-open" class="link-btn" title="Mark every row that matches this filter">Bulk review…</button>
           </div>
         </div>
-        <div id="sample-list"></div>
-      </div>
+        <div id="sample-list" class="sample-list"></div>
+      </aside>
 
-      <div id="detail-pane">
-        <div id="empty-detail" class="empty">Select a sample.</div>
-        <div id="detail" class="hidden">
-          <div class="detail-head">
-            <div>
-              <div id="d-id" class="mono strong"></div>
-              <div id="d-key" class="mono dim small"></div>
+      <div class="stage">
+        <div id="stage-empty" class="empty-state">Pick a sample from the list.</div>
+        <div id="stage-body" class="stage-body" hidden>
+          <div class="sample-head">
+            <div class="sample-id">
+              <div id="s-id" class="mono strong"></div>
+              <div id="s-key" class="mono muted small"></div>
             </div>
-            <div class="nav-btns">
-              <span id="d-pos" class="dim small"></span>
-              <button id="prev-btn" class="btn" title="Previous (↑ / k)">↑ Prev</button>
-              <button id="next-btn" class="btn" title="Next (↓ / j)">Next ↓</button>
+            <div class="sample-nav">
+              <span id="s-pos" class="muted small"></span>
+              <button id="prev-btn" class="btn" title="Previous sample (k or ↑)">← Prev</button>
+              <button id="next-btn" class="btn" title="Next sample (j or ↓)">Next →</button>
             </div>
           </div>
 
-          <!-- Labels first: the main thing to check against the audio -->
-          <div id="d-labels" class="labels"></div>
+          <div id="s-labels" class="labels"></div>
 
-          <!-- Visuals -->
-          <div class="viz">
-            <div class="viz-row">
-              <div class="axis-y" id="wave-axis"><span>+1</span><span>0</span><span>−1</span></div>
-              <div class="viz-box" id="wave-box">
-                <canvas id="wave"></canvas>
-                <div class="sel" id="sel"></div>
-                <div class="playhead" id="ph-wave"></div>
-              </div>
+          <div class="scope" id="scope">
+            <div class="track">
+              <div class="yaxis" id="wave-y"></div>
+              <div class="plot wave-plot" id="wave-plot"><canvas id="wave"></canvas><div class="region" id="region"></div><div class="playhead"></div><div class="plot-msg" id="wave-msg"></div></div>
             </div>
-            <div class="viz-row">
-              <div class="axis-y" id="spec-axis"></div>
-              <div class="viz-box" id="spec-box">
-                <img id="spec" alt="">
-                <div class="spec-loading" id="spec-loading">rendering…</div>
-                <div class="playhead" id="ph-spec"></div>
-                <div class="hover-read" id="hover-read"></div>
-              </div>
+            <div class="track tall">
+              <div class="yaxis" id="spec-y"></div>
+              <div class="plot" id="spec-plot"><img id="spec" alt="Spectrogram"><div class="playhead"></div><div class="readout" id="spec-read"></div><div class="plot-msg" id="spec-msg"></div></div>
             </div>
-            <div class="viz-row">
-              <div class="axis-y"></div>
-              <div class="axis-x" id="time-axis"></div>
-            </div>
+            <div class="track"><div class="yaxis"></div><div class="xaxis" id="time-x"></div></div>
+            <div class="scope-hint muted small">Click to seek · drag to select a region (plays and loops only that) · the region also feeds the Front-end lab</div>
           </div>
 
           <div class="transport">
-            <button id="play-btn" class="btn primary" title="Play / pause (Space)">▶ Play</button>
-            <span id="t-cur" class="mono">0:00.00</span><span class="dim">/</span><span id="t-dur" class="mono dim">0:00.00</span>
-            <label class="small">Speed
+            <button id="play-btn" class="btn primary play" title="Play / pause (Space)">▶ Play</button>
+            <span class="clock mono"><span id="t-cur">0:00.00</span> / <span id="t-dur" class="muted">0:00.00</span></span>
+            <label class="ctl">Speed
               <select id="speed"><option>0.5</option><option>0.75</option><option selected>1</option><option>1.25</option><option>1.5</option><option>2</option></select>
             </label>
-            <label class="small" title="Boost quiet clips (Web Audio gain)">Gain
+            <label class="ctl" title="Boost quiet clips (g cycles)">Gain
               <select id="gain"><option value="0">0 dB</option><option value="6">+6 dB</option><option value="12">+12 dB</option><option value="18">+18 dB</option><option value="-12">−12 dB</option></select>
             </label>
-            <label class="small"><input type="checkbox" id="loop"> Loop</label>
-            <span class="sep"></span>
-            <label class="small" title="Model view = exactly what train.py feeds the model">Spectrogram
-              <select id="spec-kind">
-                <option value="mel">Model view: 16 kHz log-mel 80</option>
-                <option value="linear">Linear STFT @ native rate</option>
-              </select>
-            </label>
-            <select id="cmap" class="small"><option>magma</option><option>viridis</option><option>inferno</option><option>turbo</option><option value="gray_r">gray</option></select>
-            <label class="small" title="Scale the waveform to its own peak"><input type="checkbox" id="wave-norm"> Normalize wave</label>
-          </div>
-
-          <div class="grid2">
-            <!-- Review -->
-            <div class="card">
-              <div class="card-title">Your decision <span class="dim small">(1 keep · 2 reject · 3 flag · 0 clear)</span></div>
-              <div class="review-btns">
-                <button class="rv keep" data-s="keep">✓ Keep</button>
-                <button class="rv reject" data-s="reject">✗ Reject</button>
-                <button class="rv flag" data-s="flag">⚑ Flag</button>
-                <button class="rv clear" data-s="unreviewed" title="Clear decision">Clear</button>
-              </div>
-              <div id="tag-box" class="tags"></div>
-              <textarea id="note" rows="2" placeholder="Note (saved with the decision, or on blur)…"></textarea>
-              <label class="small"><input type="checkbox" id="auto-adv" checked> Go to next sample after a decision</label>
-              <div id="review-meta" class="dim small"></div>
+            <label class="ctl check"><input type="checkbox" id="loop"> Loop</label>
+            <span class="grow"></span>
+            <div class="seg small" id="spec-kind" role="radiogroup" aria-label="Spectrogram">
+              <button data-v="mel" title="Exactly what train.py feeds the model: 16 kHz, 80 HTK mels, 25 ms / 10 ms">Model log-mel</button>
+              <button data-v="linear" title="Linear-frequency STFT at the file's native rate: shows its real bandwidth">Linear STFT</button>
             </div>
-            <!-- Metrics -->
-            <div class="card">
-              <div class="card-title">Signal metrics <span class="dim small">(automatic)</span></div>
-              <div id="d-flags" class="flags"></div>
-              <div id="d-metrics" class="metrics"></div>
-            </div>
+            <select id="cmap" aria-label="Colour map"></select>
+            <label class="ctl check" title="Scale the waveform to its own peak"><input type="checkbox" id="wave-norm"> Fit wave</label>
           </div>
+        </div>
+      </div>
 
-          <details class="card" id="meta-card">
-            <summary class="card-title">All metadata columns</summary>
-            <table id="d-meta" class="kv"></table>
+      <aside class="inspector">
+        <div id="insp-body" hidden>
+          <section class="panel">
+            <h2 class="panel-title">Your call</h2>
+            <div class="verdicts">
+              <button class="verdict keep" data-s="keep"><span>Keep</span><kbd>1</kbd></button>
+              <button class="verdict reject" data-s="reject"><span>Reject</span><kbd>2</kbd></button>
+              <button class="verdict flag" data-s="flag"><span>Flag</span><kbd>3</kbd></button>
+            </div>
+            <div class="verdict-foot">
+              <span id="review-meta" class="muted small"></span>
+              <button class="link-btn" data-s="unreviewed" id="clear-btn">Clear <kbd>0</kbd></button>
+            </div>
+            <div class="eyebrow">Reasons <span class="muted">(Shift + 1…9)</span></div>
+            <div id="tags" class="chips"></div>
+            <textarea id="note" rows="2" placeholder="Note, saved with your call" aria-label="Note"></textarea>
+            <label class="ctl check small"><input type="checkbox" id="auto-adv" checked> Jump to the next sample after a call</label>
+          </section>
+
+          <section class="panel">
+            <h2 class="panel-title">Signal checks <span class="muted small">automatic</span></h2>
+            <div id="s-flags" class="chips"></div>
+            <dl id="s-metrics" class="metrics"></dl>
+          </section>
+
+          <details class="panel">
+            <summary class="panel-title">All metadata</summary>
+            <div class="table-wrap"><table id="s-meta" class="kv"></table></div>
           </details>
         </div>
+      </aside>
+    </section>
+
+    <!-- ================= report ================= -->
+    <section id="view-report" class="view report" hidden>
+      <div class="report-inner">
+        <section class="panel scan">
+          <div>
+            <h2 class="panel-title">Quality scan</h2>
+            <p class="muted small">Decodes random rows and computes signal metrics and automatic checks. Results are cached and add up
+              across scans; Review can then filter and sort by them.</p>
+          </div>
+          <div class="scan-ctl">
+            <select id="scan-n" aria-label="Rows to scan">
+              <option value="200">+200 random rows</option>
+              <option value="1000" selected>+1,000 random rows</option>
+              <option value="5000">+5,000 random rows</option>
+              <option value="100000000">Every remaining row</option>
+            </select>
+            <button id="scan-start" class="btn primary">Start scan</button>
+            <button id="scan-cancel" class="btn" hidden>Cancel</button>
+            <button id="scan-clear" class="link-btn" title="Delete cached metrics for this dataset (reviews stay)">Reset metrics</button>
+            <a id="csv-link" class="link-btn" href="#">Download CSV</a>
+          </div>
+          <div id="scan-progress" class="progress" hidden><div class="fill"></div><span class="small"></span></div>
+        </section>
+        <div id="report-body"></div>
       </div>
     </section>
 
-    <!-- ===== Report tab ===== -->
-    <section id="tab-report" class="tab hidden">
-      <div class="card scan-card">
-        <div>
-          <div class="card-title">Quality scan</div>
-          <div class="dim small">Decodes a random sample of rows and computes signal metrics + auto-flags. Results are
-            cached, so scans add up; the Inspect tab can then filter and sort by them.</div>
+    <!-- ================= lab ================= -->
+    <section id="view-lab" class="view lab" hidden>
+      <aside class="lab-controls" id="lab-controls">
+        <div class="lab-status-row">
+          <h2 class="panel-title">Front-end settings</h2>
+          <span id="lab-status" class="status" data-state="idle">Idle</span>
         </div>
-        <div class="scan-ctl">
-          <select id="scan-n">
-            <option value="200">+200 random rows</option>
-            <option value="1000" selected>+1,000 random rows</option>
-            <option value="5000">+5,000 random rows</option>
-            <option value="100000000">All remaining rows</option>
-          </select>
-          <button id="scan-btn" class="btn primary">Start scan</button>
-          <button id="scan-cancel" class="btn hidden">Cancel</button>
-          <button id="scan-clear" class="btn small" title="Delete cached metrics for this dataset">Reset</button>
-        </div>
-        <div id="scan-progress" class="progress hidden"><div></div><span></span></div>
-      </div>
+        <p class="muted small">Change anything and the results update. Values that differ from <span class="mono">train.py</span>
+          are marked <i class="changed-dot"></i>; click the dot to reset one.</p>
 
-      <div id="report-body"></div>
+        <div class="field">
+          <label for="lab-preset" class="field-label">Start from a preset</label>
+          <select id="lab-preset"></select>
+        </div>
+
+        <div id="lab-fields"></div>
+
+        <fieldset class="group">
+          <legend>Clip region</legend>
+          <div class="pair">
+            <label class="field-label">Start (s)<input id="lab-start" type="number" min="0" step="0.1" value="0"></label>
+            <label class="field-label">Length (s)<input id="lab-dur" type="number" min="0.2" max="30" step="0.5" value="8"></label>
+          </div>
+          <button id="lab-use-sel" class="btn block small" title="Drag on the Review waveform to select a region">Use the region selected in Review</button>
+        </fieldset>
+
+        <div class="lab-actions">
+          <label class="ctl check small"><input type="checkbox" id="lab-auto" checked> Update automatically</label>
+          <button id="lab-run" class="btn primary">Run <kbd>Enter</kbd></button>
+          <button id="lab-reset" class="link-btn">Reset all</button>
+        </div>
+      </aside>
+
+      <div class="lab-results" id="lab-results">
+        <div id="lab-empty" class="empty-state">Open a sample in Review first. The lab runs that sample.</div>
+        <div id="lab-body" hidden>
+          <div class="lab-clip">
+            <span class="eyebrow">Clip</span> <span id="lab-clip" class="mono"></span>
+          </div>
+          <div id="lab-derived" class="derived" aria-live="polite"></div>
+          <div id="lab-notes" class="notes"></div>
+          <div id="lab-scores" class="tiles"></div>
+
+          <section class="panel">
+            <h2 class="panel-title">Listen <span class="muted small">click a plot to seek · Space plays the last one</span></h2>
+            <div id="lab-listen" class="listen"></div>
+          </section>
+
+          <section class="panel">
+            <h2 class="panel-title">Pipeline <span class="muted small">each stage feeds the next; hover for time and frequency</span></h2>
+            <div id="lab-pipeline" class="pipeline"></div>
+          </section>
+
+          <div class="lab-grid">
+            <section class="panel">
+              <h2 class="panel-title">One token <span id="lab-patch-title" class="muted small"></span></h2>
+              <p class="muted small">Click stage 4 to pick a token (← / → step). Left: the <span class="mono">STACK × N_MELS</span> block. Right: the same
+                numbers flattened frame by frame into the vector the adapter projects to one LLM token.</p>
+              <div class="patch"><canvas id="lab-patch-img"></canvas><canvas id="lab-patch-vec"></canvas></div>
+            </section>
+            <section class="panel">
+              <h2 class="panel-title">Mel filterbank <span id="lab-fb-title" class="muted small"></span></h2>
+              <p class="muted small">Each triangle sums FFT bins into one mel channel: narrow at low and wide at high frequencies.</p>
+              <div class="chart-box"><canvas id="lab-fb" class="chart"></canvas><div class="chart-tip"></div></div>
+            </section>
+            <section class="panel">
+              <h2 class="panel-title">Long-term spectrum</h2>
+              <p class="muted small">Average power per Hz over the clip: what resampling cuts and what the mel smoothing keeps.</p>
+              <div id="lab-ltas-legend" class="legend-row"></div>
+              <div class="chart-box"><canvas id="lab-ltas" class="chart"></canvas><div class="chart-tip"></div></div>
+            </section>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 </div>
 
-<!-- Bulk dialog -->
+<!-- ================= dialogs ================= -->
 <dialog id="bulk-dlg">
   <form method="dialog">
     <h3>Bulk review</h3>
-    <p class="small">Apply to <b id="bulk-n"></b> rows matching the current filter.</p>
-    <label>Status <select id="bulk-status"><option value="reject">reject</option><option value="flag">flag</option><option value="keep">keep</option><option value="unreviewed">clear</option></select></label>
-    <label>Add tag <select id="bulk-tag"><option value="">(none)</option></select></label>
-    <div class="row end"><button value="cancel" class="btn">Cancel</button><button id="bulk-ok" value="ok" class="btn primary">Apply</button></div>
+    <p class="small">Applies to <b id="bulk-n"></b> rows that match <span id="bulk-desc"></span>.</p>
+    <label class="field-label">Set status
+      <select id="bulk-status"><option value="reject">Reject</option><option value="flag">Flag</option><option value="keep">Keep</option><option value="unreviewed">Clear</option></select></label>
+    <label class="field-label">Add reason <select id="bulk-tag"><option value="">None</option></select></label>
+    <div class="dlg-actions"><button value="cancel" class="btn">Cancel</button><button value="ok" class="btn primary">Apply</button></div>
   </form>
 </dialog>
 
-<!-- Help -->
+<dialog id="confirm-dlg">
+  <form method="dialog">
+    <h3 id="confirm-title"></h3>
+    <p id="confirm-body" class="small"></p>
+    <div class="dlg-actions"><button value="cancel" class="btn">Cancel</button><button value="ok" id="confirm-ok" class="btn primary"></button></div>
+  </form>
+</dialog>
+
 <dialog id="help-dlg">
   <form method="dialog">
     <h3>Keyboard shortcuts</h3>
-    <table class="kv">
-      <tr><th>Space</th><td>play / pause</td></tr>
-      <tr><th>← / →</th><td>seek −/+ 1 s</td></tr>
-      <tr><th>↓ / j &nbsp; ↑ / k</th><td>next / previous sample</td></tr>
-      <tr><th>1 / 2 / 3 / 0</th><td>keep / reject / flag / clear</td></tr>
-      <tr><th>Shift + 1…9</th><td>toggle the n-th tag</td></tr>
-      <tr><th>s</th><td>switch spectrogram (model view ↔ linear)</td></tr>
-      <tr><th>g</th><td>cycle gain</td></tr>
-      <tr><th>l</th><td>loop on / off</td></tr>
-      <tr><th>n</th><td>focus note</td></tr>
-      <tr><th>drag on waveform</th><td>select a region (plays / loops only that)</td></tr>
-      <tr><th>?</th><td>this help</td></tr>
+    <table class="kv keys">
+      <tr><th colspan="2" class="eyebrow">Review</th></tr>
+      <tr><td><kbd>Space</kbd></td><td>Play / pause</td></tr>
+      <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>Seek 1 s</td></tr>
+      <tr><td><kbd>j</kbd> <kbd>k</kbd> or <kbd>↓</kbd> <kbd>↑</kbd></td><td>Next / previous sample</td></tr>
+      <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>0</kbd></td><td>Keep / reject / flag / clear</td></tr>
+      <tr><td><kbd>Shift</kbd> + <kbd>1</kbd>…<kbd>9</kbd></td><td>Toggle a reason</td></tr>
+      <tr><td><kbd>s</kbd></td><td>Model log-mel ↔ linear STFT</td></tr>
+      <tr><td><kbd>g</kbd> <kbd>l</kbd> <kbd>n</kbd></td><td>Cycle gain · loop · focus note</td></tr>
+      <tr><th colspan="2" class="eyebrow">Front-end lab</th></tr>
+      <tr><td><kbd>Space</kbd></td><td>Play / pause the last clip</td></tr>
+      <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>Previous / next token</td></tr>
+      <tr><td><kbd>Enter</kbd></td><td>Run now</td></tr>
+      <tr><th colspan="2" class="eyebrow">Anywhere</th></tr>
+      <tr><td><kbd>?</kbd></td><td>This list</td></tr>
     </table>
-    <div class="row end"><button class="btn">Close</button></div>
+    <div class="dlg-actions"><button class="btn">Close</button></div>
   </form>
 </dialog>
 
-<div id="toast"></div>
-<script src="/static/app.js"></script>
+<div id="toast" role="status"></div>
 </body>
 </html>

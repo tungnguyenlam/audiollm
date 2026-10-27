@@ -162,3 +162,37 @@ Earlier months: `docs/worklog_archive/YYYY-MM.md`.
   3. `mix654h_rebal_conv_stack8_cont19k`: same budget, `ami_ihm/train*2+fleurs_en/train*6` (654 h/epoch);
   4. `ls100h_conv_stack8_12768`: cold start, train-clean-100 only, same 12,768-step schedule as the 544 h run.
 - 2 vs 3 isolates data balance at equal steps; 4 vs `mix544h_conv_stack8` isolates data volume for the conv projector.
+
+## 2026-10-27 - Dataset viewer: "Front-end lab" tab
+- New tab in `dataset_viewer` (backend `dataset_viewer/frontend_lab.py`, `/api/lab`, UI `static/lab.js`): runs the
+  selected sample through resample -> PCM/mu-law quantisation -> STFT -> mel -> log -> feature precision
+  (fp32/bf16/fp16/int8) -> per-clip MVN -> stack, with presets matching the notebook's section 4b sweep.
+- Shows waveform (+ quantisation error), STFT power, mel power (linear), log-mel, normalised log-mel with token
+  boundaries, a clickable patch inspector, the mel filterbank and long-term spectra; plays original / processed /
+  error / Griffin-Lim from |STFT| / Griffin-Lim from log-mel. Scores LSD vs a 16 kHz reference like the notebook.
+- Spot check (one LibriSpeech clip, 8 s): 8-bit PCM qSNR 23-31 dB (LSD +6-8 dB); 8-bit mu-law LSD 2.2 dB;
+  4-bit PCM ~20 dB; bf16/int8 log-mel max error ~0.03 (log-mel LSD unchanged).
+
+## 2026-10-27 - Full re-benchmark of mix544h_conv_stack8 with cap6+nr4 decoding
+
+- `results/mel_20261027-150147_mix544h_conv_stack8/` (old decode kept in `..._maxnew200/`), WER (sub/del/ins):
+  ls_clean 71.29 (52.1/7.3/11.9), ls_other 85.30, voxpopuli 105.96, ami **77.72** (was 92.79), earnings22
+  **114.66** (was 202.63), gigaspeech 92.25, spgispeech 110.75 (was 141.29); extra fleurs_en 107.84, edacc 97.73.
+  Open ASR mean 116.91 -> **93.99**. Benchmark wall time ~43 min (RTFx 190-325, was 79-280).
+- Substitutions are still 53-82% everywhere except LibriSpeech/AMI: the remaining OOD gap is acoustic, not decoding.
+- Queue step 2 (`20261027-230948_mix544h_conv_stack8_cont19k`) started cleanly: val @1000 70.79 (shuffle 106.79),
+  loss 1.44, ETA ~3.7 h.
+
+## 2026-10-27 - Dataset viewer rebuilt (server + UI)
+- Why: changing settings in the Front-end lab looked like it did nothing. The play buttons kept the previous run's
+  audio (`L.playing` was never reset after a re-run). Also, `python -m dataset_viewer` with the system python died on
+  a missing `uvicorn`.
+- `server.py` rewritten: one `/api/bootstrap`; lab results are cached by a hash of (dataset, row, settings), so files
+  never expire while shown and repeat settings return in ~10 ms (vs ~0.6 s); at most 2 lab runs at a time; clearer
+  error messages. `__main__` now explains the venv when imports fail. Data/DSP modules, the SQLite schema and the
+  manifest are unchanged.
+- `static/` replaced by `index.html`, `style.css` and ES modules in `static/js/` (core, main, review, report, lab).
+  In the lab, the settings object is the only state, runs are serialised so the latest settings win, and changed
+  values are marked against `train.py` with derived numbers that update instantly. Light and dark themes, phone width.
+- Verified with headless Chromium: settings clicks, typing, rapid changes, presets, reset and audio after a change
+  (fetched for the new settings key); review next/flag/clear; report tiles and histograms; no console errors.
