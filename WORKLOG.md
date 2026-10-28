@@ -329,3 +329,18 @@ Earlier months: `docs/worklog_archive/YYYY-MM.md`.
 - Each run now saves its MVN stats as `runs/<id>/mvn.pt`; eval/benchmark/resume prefer that copy over the data/ cache.
 - `requirements.txt` (pinned, torch excluded) and a Colab section in the README. No wandb: the Hub mirror already
   carries plots.png / metrics.jsonl / log.txt.
+
+## 2026-10-28 - SpecAugment on 100 h: worse, stopped at step ~8650
+- Run `20261028-152147_ls100h_conv_stack8_12768_specaug` (ls100h_conv_stack8_12768 config + 2x F27 + 2x T100).
+  Stopped by hand (status interrupted), no weights saved.
+
+  | step | baseline dev-clean / shuffled / loss | SpecAugment dev-clean / shuffled / loss |
+  |---|---|---|
+  | 4000 | 99.4 / 111.7 / 2.14 | 110.1 / 112.1 / 3.01 |
+  | 6000 | 87.7 / 105.7 / 0.99 | 108.6 / 114.8 / 2.16 |
+  | 8500 | 84.4 / 104.5 / 0.24 | 108.6 / 111.8 / 1.18 |
+- Reading: it does slow memorisation (loss 1.18 vs 0.24), but the model never starts using the audio. The gap to
+  shuffled audio is ~3 pt vs ~20 pt for the baseline. At 100 h and this LR schedule, masking up to 2 s of audio plus
+  27/80 mel bins removes the signal the projector needs to align in the first place. Rules out SpecAugment from step 0
+  as the 100 h fix. Untested: milder policy, or turning it on only after alignment (warm start).
+- The queue went on to B `mix1040h_conv_stack8_cont2_19k` (+train-other-500), then C (544 h control).
