@@ -131,3 +131,40 @@ class LogMelFeaturizer:
     def __call__(self, audio_filepath):
         """(num_frames, feature_dim) normalised features of one audio file."""
         return (extract_log_mel_spectrogram(audio_filepath) - self.mvn_stats["mean"]) / self.mvn_stats["std"]
+
+
+class SpecAugment:
+    """
+    Frequency + time masking on (num_frames, feature_dim) normalised features (no time warping). Masked bins become 0,
+    the MVN mean. Runs inside DataLoader workers, whose torch RNGs PyTorch seeds differently per worker and epoch.
+    """
+
+    def __init__(self, freq_masks, freq_width, time_masks, time_width, max_time_ratio):
+        self.freq_masks, self.freq_width = freq_masks, freq_width
+        self.time_masks, self.time_width, self.max_time_ratio = time_masks, time_width, max_time_ratio
+
+    @classmethod
+    def from_config(cls):
+        """SpecAugment from the SPECAUG_* config, or None when both mask counts are 0."""
+        if not (C.SPECAUG_FREQ_MASKS or C.SPECAUG_TIME_MASKS):
+            return None
+        return cls(C.SPECAUG_FREQ_MASKS, C.SPECAUG_FREQ_WIDTH, C.SPECAUG_TIME_MASKS, C.SPECAUG_TIME_WIDTH,
+                   C.SPECAUG_MAX_TIME_RATIO)
+
+    def __repr__(self):
+        return (f"SpecAugment({self.freq_masks} freq masks <= {self.freq_width} bins, {self.time_masks} time masks "
+                f"<= min({self.time_width} frames, {self.max_time_ratio:g} x utt))")
+
+    @staticmethod
+    def _mask(features, dim, num_masks, max_width):
+        size = features.shape[dim]
+        for _ in range(num_masks):
+            width = int(torch.randint(0, min(max_width, size) + 1, ()))
+            start = int(torch.randint(0, size - width + 1, ()))
+            features.narrow(dim, start, width).zero_()
+
+    def __call__(self, features):
+        features = features.clone()
+        self._mask(features, 1, self.freq_masks, self.freq_width)
+        self._mask(features, 0, self.time_masks, min(self.time_width, int(self.max_time_ratio * features.shape[0])))
+        return features

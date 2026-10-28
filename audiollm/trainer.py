@@ -12,7 +12,7 @@ from audiollm import config as C
 from audiollm.data import (SpeechDataset, create_dataloader, create_length_batched_sampler,
                            create_token_batched_sampler, load_train_items, load_validation_items, parse_val_splits)
 from audiollm.evaluate import evaluate_dataset, format_eval_metrics, run_test_evaluation, val_hypotheses_path
-from audiollm.features import LogMelFeaturizer, compute_or_load_mvn_stats
+from audiollm.features import LogMelFeaturizer, SpecAugment, compute_or_load_mvn_stats
 from audiollm.model import SpeechLLM
 from audiollm.utils import compute_context, format_duration, make_progress_bar
 
@@ -141,7 +141,9 @@ def train(args, run_dir, tracker, log_and_print):
         log_and_print(f"diagnostics: train subset {C.TRAIN_N or 'all'}, val on {', '.join(validation_sets)}, "
                       f"audio ablations {val_ablations or 'none'}")
 
-    train_dataset = SpeechDataset(train_items, featurizer, model.tokenizer)
+    augment = SpecAugment.from_config()
+    log_and_print(f"train augmentation: {augment or 'none'}")
+    train_dataset = SpeechDataset(train_items, featurizer, model.tokenizer, augment=augment)
 
     optimizer_step = 0
     micro_step = 0

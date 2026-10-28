@@ -206,6 +206,7 @@ with a flag, and the resolved values are saved in each run's `config.json`.
 | tokenization | stack 16 frames → 1280-d patches at 6.25 Hz, zero-pad tail | paper's ASR rate is stack 8 / 12.5 Hz (640-d < 1024 hidden); `--stack 8` reproduces it |
 | projector | single `nn.Linear`, `PROJ_INIT=match_emb` (`N(0, emb_std/sqrt(fan_in))`, zero bias) | `--proj_init default` for PyTorch's default init (~20× larger than text embeddings) |
 | LLM | LFM2.5-230M-Base, bf16, frozen + LoRA r64/α128 (`LORA_TARGETS=all-linear`: conv `in_proj`/`out_proj`, attn `q/k/v/out_proj`, MLP `w1/w2/w3`; not embeddings/`lm_head`) | no quantization; 2.6B-Base for paper-scale runs |
+| augmentation | none (`SPECAUG_*_MASKS=0`) | `--specaug_freq_masks 2 --specaug_time_masks 2` = SpecAugment LD policy (F≤27 bins, T≤100 frames, each time mask ≤0.2 of the utt), train set only, masked bins set to the MVN mean |
 | precision | `PRECISION=bf16`: LoRA + projector weights, grads and AdamW states all bf16 | `amp` = fp32 master weights + bf16 autocast; `fp32` = runs before 2026-10-27 (fp32 LoRA/projector, ~1.65x slower/step) |
 | optim | AdamW lr 1e-4, 200 warmup → cosine decay (`--lr_schedule linear` for the old schedule), clip 1.0, eff. batch 32, 2 epochs; `--optimizer muon` = `torch.optim.Muon` on every trainable 2D weight (LoRA A/B + projector weight), no AdamW at all (projector bias frozen), `--muon_adjust_lr match_rms_adamw` so the AdamW lr/wd carry over | paper's lr/clip |
 | decode | greedy, batched left-pad, max 200 new tokens | |

@@ -68,6 +68,15 @@ MVN_N = 2000
 #   - Trade-off: STACK=8 yields 12.5 Hz (paper default, finer phonetic resolution, 2x longer LLM sequence length),
 #     whereas STACK=16 halves sequence length and compute while yielding 1280-d patches (>= 230M LLM hidden dim 1024).
 STACK = 16
+
+# SpecAugment (Park et al. 2019) on the normalised train features only; masked bins are set to 0 (= the MVN mean).
+#   - LibriSpeech "LD" policy is 2 freq masks of width <= 27 + 2 time masks of width <= 100 frames (1 s).
+#   - Each time mask is also capped at SPECAUG_MAX_TIME_RATIO of the utterance, so a 1 s utt is never fully masked.
+SPECAUG_FREQ_MASKS = 0       # number of frequency masks per train utterance (0 = off)
+SPECAUG_FREQ_WIDTH = 27      # max width of each frequency mask, in mel bins
+SPECAUG_TIME_MASKS = 0       # number of time masks per train utterance (0 = off)
+SPECAUG_TIME_WIDTH = 100     # max width of each time mask, in frames (10 ms each)
+SPECAUG_MAX_TIME_RATIO = 0.2 # each time mask covers at most this fraction of the utterance
 # ------------------------------------------------------------------------------------------------
 
 # Model and optimization hyperparameters

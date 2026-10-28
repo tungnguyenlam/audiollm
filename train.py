@@ -177,7 +177,9 @@ def override_name_suffix(config):
              "GRAD_CLIP": "clip", "LR_SCHEDULE": "sched", "MIN_LR_RATIO": "minlr", "OPTIMIZER": "opt",
              "MUON_ADJUST_LR": "muonlr", "TRAIN_SPLIT": "train", "PRECISION": "prec", "MAX_TRAIN_SEC": "maxsec",
              "MIN_TRAIN_SEC": "minsec", "TRAIN_N": "n", "VAL_FROM_TRAIN": "valtrain", "PROJECTOR": "proj",
-             "PROJ_INIT": "pinit", "PROJ_LR_MULT": "plr", "PROJ_ONLY_STEPS": "ponly", "TRAIN_STEPS": "steps"}
+             "PROJ_INIT": "pinit", "PROJ_LR_MULT": "plr", "PROJ_ONLY_STEPS": "ponly", "TRAIN_STEPS": "steps",
+             "SPECAUG_FREQ_MASKS": "fm", "SPECAUG_FREQ_WIDTH": "fw", "SPECAUG_TIME_MASKS": "tm",
+             "SPECAUG_TIME_WIDTH": "tw", "SPECAUG_MAX_TIME_RATIO": "tr"}
     skip = runs_lib.IGNORED_KEYS | {"MODEL", "STACK", "EVAL_EVERY", "VAL_N", "TEST_SPLITS", "DATA", "MAX_NEW_TOKENS",
                                     "MAX_TOKENS_PER_SEC", "MAX_TOKENS_PAD", "NO_REPEAT_NGRAM_SIZE", "INIT_FROM", "MVN_SPLIT",
                                     "EVAL_AUDIO_ABLATIONS"}

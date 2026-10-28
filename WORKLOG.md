@@ -289,3 +289,20 @@ Earlier months: `docs/worklog_archive/YYYY-MM.md`.
   counts and `language_info` run metadata; working copies keep their outputs. Per-clone setup is in README.
   History check: no commit so far contained notebook outputs.
 - `runs/latest_model` skips `--max_steps` smoke runs (they save weights and were taking the link over).
+
+## 2026-10-28 - SpecAugment added; queued +train-other-500 continuation with a same-data control
+- Review of the ls100h ablation conclusions: "conv projector ignites" is confounded (the earlier 100 h runs also differ
+  in LR / PROJ_LR_MULT / warmup / precision); "36.8 is data-bound" mixes steps with data (cont19k = +19.2k steps on the
+  same 544 h, best val at step 19000/19200, so still improving). The clean finding is 100 h vs 544 h at a fixed
+  config and step count: test-clean 84.00 vs 70.98.
+- Code: `SPECAUG_FREQ_MASKS/FREQ_WIDTH/TIME_MASKS/TIME_WIDTH/MAX_TIME_RATIO` (`features.SpecAugment`, passed to the
+  train `SpeechDataset` only). Masked bins = 0 = MVN mean. Off by default, so old configs are unchanged.
+  GPU smoke run OK (1.05 s/step).
+- Run A `20261028-152147_ls100h_conv_stack8_12768_specaug`: ls100h_conv_stack8_12768 config + 2x F27 + 2x T100
+  (<=0.2 utt). Tests whether augmentation fixes the 100 h memorisation (train ppl 1.04, dev plateau ~82, ~22 pt over
+  shuffled audio). ETA ~3 h.
+- Queued after A finishes and train-other-500 is unpacked (`prepare_data.py train-other-500`):
+  - B `mix1040h_conv_stack8_cont2_19k`: warm start from cont19k, +train-other-500 (~1040 h), same 19.2k-step schedule.
+  - C `mix544h_conv_stack8_cont2_19k`: the same, but on the 544 h mix. This control separates +500 h from +steps.
+  - Both add dev-other as the 4th val split (train-other-500 should mostly help test-other).
+- Output-LayerNorm idea deferred: no run has shown the audio/text norm gap hurts.

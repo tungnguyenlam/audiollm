@@ -114,12 +114,16 @@ def load_train_items():
 
 # ---------------------------------------------------------------- dataset
 class SpeechDataset(torch.utils.data.Dataset):
-    """Utterance records -> {"features": (num_frames, feature_dim), "target": token ids + [EOS], "text", "id", "sec"}."""
+    """
+    Utterance records -> {"features": (num_frames, feature_dim), "target": token ids + [EOS], "text", "id", "sec"}.
+    augment (e.g. features.SpecAugment, train set only) maps the features to augmented features of the same shape.
+    """
 
-    def __init__(self, dataset_items, featurizer, tokenizer):
+    def __init__(self, dataset_items, featurizer, tokenizer, augment=None):
         self.dataset_items = dataset_items
         self.featurizer = featurizer
         self.tokenizer = tokenizer
+        self.augment = augment
 
     def __len__(self):
         return len(self.dataset_items)
@@ -131,8 +135,9 @@ class SpeechDataset(torch.utils.data.Dataset):
             self.tokenizer(" " + item["text"], add_special_tokens=False).input_ids
             + [self.tokenizer.eos_token_id]
         )
+        features = self.featurizer(item["path"])  # (num_frames, feature_dim), full frame rate
         return {
-            "features": self.featurizer(item["path"]),  # (num_frames, feature_dim), full frame rate
+            "features": self.augment(features) if self.augment else features,
             "target": target_token_ids,
             "text": item["text"],
             "id": item["id"],
