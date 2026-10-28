@@ -13,11 +13,50 @@ wav ─► 80-d log-mel (25ms win / 10ms hop) ─► MVN (train stats) ─► st
     ─► Linear(1280 → 1024) ─► [BOS][audio…]["Transcription:"][ text ][EOS] ─► LFM2.5-230M-Base (frozen) + LoRA
 ```
 
-Trained: the `Linear` projector (all of it) and LoRA adapters inside the LLM. The LLM's own weights stay frozen.
+Trained: the projector (all of it) and LoRA adapters inside the LLM. The LLM's own weights stay frozen.
+
+## Code layout
+
+`train.py` is the command line; the parts it puts together live in `audiollm/`, one module per role:
+
+| module | role |
+|---|---|
+| `config.py` | every UPPERCASE default (= CLI flag), `apply_config`, `--config` / legacy-config handling |
+| `data.py` | split specs → utterance records, `SpeechDataset` (frame-level features + target ids), fixed-size or token-budget batching |
+| `features.py` | waveform → MVN-normalised log-mel frames at 100 Hz (`LogMelFeaturizer`), MVN cache |
+| `projectors/` | frames → LLM embeddings, one class per `PROJECTOR`: `linear`, `mlp` (`stack.py`), `conv` (`conv.py`) |
+| `backbone.py` | `MODEL` + tokenizer + LoRA |
+| `model.py` | `SpeechLLM` = backbone + projector: `[BOS][audio][prompt][text][EOS]` layout, loss, greedy decoding, model summary |
+| `trainer.py`, `evaluate.py`, `tracking.py` | training loop, WER evaluation, run directories |
+
+The dataset always emits frames at the full 100 Hz rate; how they become tokens is entirely the projector's job.
+A projector takes padded frames `(batch, frames, 80)` plus lengths and returns a `ProjectorOutput`: padded
+embeddings, **tokens per utterance** (so variable-rate projectors fit), an optional `aux_loss` added to the LM loss,
+and `stats` that are logged with the train metrics. To add one, subclass `AudioProjector` in a new file under
+`audiollm/projectors/`, decorate it with `@register_projector("<name>")`, import it in `projectors/__init__.py`, and
+train with `--projector <name>`.
 
 `explore_pipeline.ipynb` is the guide: it walks through this pipeline step by step (data and splits, batching, mel
 patches, the `Linear` adapter, where LoRA sits, the final input sequence, run tracking) using the functions from
-`train.py`.
+`train.py` (written before the `audiollm/` split; `import train as T` still reaches every config constant and package
+function, but cells that call the old signatures, e.g. `T.SpeechDataset(items, mvn, tok)`, need updating).
+
+Notebooks are committed without outputs: `.gitattributes` routes `*.ipynb` through `tools/strip_notebook_outputs.py`,
+which strips outputs from the committed copy only (your local notebook keeps them). Enable it once per clone:
+`git config filter.strip-notebook-outputs.clean "python3 tools/strip_notebook_outputs.py"` and
+`git config filter.strip-notebook-outputs.smudge cat`.
+
+## Models
+
+Base LLMs used or queued for runs (pass with `--model`). The `hidden` column sets the projector output width.
+
+| model | hidden | layers | status | notes |
+|---|---|---|---|---|
+| [`LiquidAI/LFM2.5-230M-Base`](https://huggingface.co/LiquidAI/LFM2.5-230M-Base) | 1024 | 14 | default | fast experiments |
+| [`LiquidAI/LFM2.5-350M-Base`](https://huggingface.co/LiquidAI/LFM2.5-350M-Base) | 1024 | 16 | used | |
+| [`LiquidAI/LFM2.5-350M`](https://huggingface.co/LiquidAI/LFM2.5-350M) | 1024 | 16 | used | instruct, not base |
+| [`LiquidAI/LFM2.5-2.6B-Base`](https://huggingface.co/LiquidAI/LFM2.5-2.6B-Base) | 2048 | 30 | target | paper-scale |
+| [`LiquidAI/LFM3-1.7B-Base`](https://huggingface.co/LiquidAI/LFM3-1.7B-Base) | 2048 | 24 | untested | custom code (`trust_remote_code`); conv + full/sliding attention; EOS is `<\|im_end\|>` |
 
 ## Run
 
@@ -34,9 +73,13 @@ python train.py --eval_only runs/<id>        # re-run test eval with that run's 
 python train.py --benchmark_sets none        # skip the post-training Open ASR benchmark
 ```
 
-Every UPPERCASE constant at the top of `train.py` is the default for a lower-case flag of the same name
+Every UPPERCASE constant in `audiollm/config.py` is the default for a lower-case flag of the same name
 (`LR` → `--lr`, `TEST_SPLITS` → `--test_splits a b`, `GRAD_CKPT` → `--no-grad_ckpt`); see `python train.py --help`.
-Precedence: explicit flags > `--config` file > constants in `train.py`.
+Precedence: explicit flags > `--config` file > constants in `audiollm/config.py`.
+
+`--batch_tokens N` replaces the fixed `--batch_size` with batches of up to N padded positions
+(utterances × longest `[BOS][audio][prompt][text][EOS]` in the batch), so short utterances come in big batches and
+long ones in small batches.
 
 ## Run tracking
 
@@ -45,6 +88,11 @@ run name is `<model>_stack<N>` plus the hyperparameters you changed, e.g. `--epo
 `..._LFM2.5-230M-Base_stack16_epochs10_bs16`.
 
 - **`runs/latest/`** is a symlink to the newest run: `tail -f runs/latest/log.txt`, open `runs/latest/plots.png`.
+  It may still be training, and weights are only written at the end of a run.
+- **`runs/latest_model/`** is a symlink to the newest run that has saved weights (`lora/` + `proj.pt`):
+  `python benchmark.py mel:runs/latest_model`. `python runs.py best` lists the best finished run per base LLM.
+- At startup every run logs a **model summary** (LLM shape, parameter counts per component, frozen vs trainable,
+  dtype, the projector's layers) and saves it as `model_summary.txt`; the counts also go to `summary.json`.
 - **`runs/INDEX.md`**: every run, newest first, with status/step, what it changed, best val, test and benchmark WER.
 - After training + test eval, `train.py` benchmarks the in-memory model on all Open ASR sets (`BENCHMARK_SETS`,
   `--benchmark_sets none` to skip; smoke runs skip it). A benchmark error is recorded, it doesn't fail the run.
@@ -54,7 +102,8 @@ run name is `<model>_stack<N>` plus the hyperparameters you changed, e.g. `--epo
 | `config.json` | resolved config (UPPERCASE keys) + `meta`: command, notes, overrides vs defaults, git commit/dirty, host, GPU |
 | `git_diff.patch` | uncommitted changes at launch (only if the tree was dirty), so dirty runs stay reproducible |
 | `metrics.jsonl` | one row per train log window (loss, lr, grad norm, speed, mem), val pass and test split |
-| `summary.json` | status (`running`/`done`/`failed`/`interrupted`), current step, best val WER, test WER, duration, `benchmark` {set: WER} |
+| `summary.json` | status (`running`/`done`/`failed`/`interrupted`), current step, best val WER, test WER, duration, `benchmark` {set: WER}, `params_*` counts |
+| `model_summary.txt` | LLM shape, parameter counts per component (frozen / trainable / dtype), projector modules |
 | `plots.png` | train loss (+EMA), grad norm vs clip threshold (% clipped), lr, val WER (+sub/del/ins, test WER), throughput, memory; redrawn every `PLOT_EVERY` steps and after each val |
 | `log.txt`, `lora/`, `proj.pt`, `hyp_<split>.jsonl`, `test_results.json` | as before |
 
@@ -66,9 +115,11 @@ python runs.py diff <run_a> <run_b>     # what changed between two runs
 python runs.py curve <run> --every 5    # train loss / val WER over steps
 python runs.py plot [<run> ...]         # (re)draw plots.png (default: all runs) + INDEX.md
 python runs.py latest                   # path of the newest run
+python runs.py latest --model           # path of the newest run with saved weights
+python runs.py best                     # best finished run per base LLM (by in-training val WER)
 ```
 
-`<run>` is a path, a run id, a unique substring of one (e.g. the `--run_name`), or `latest`.
+`<run>` is a path, a run id, a unique substring of one (e.g. the `--run_name`), `latest` or `latest_model`.
 
 ## Data
 
@@ -145,7 +196,7 @@ python benchmark.py --table --all_runs                            # ... plus eve
 
 ## What is fixed (the "control")
 
-All knobs are UPPERCASE constants at the top of `train.py` (the defaults); any of them can be overridden per run
+All knobs are UPPERCASE constants in `audiollm/config.py` (the defaults); any of them can be overridden per run
 with a flag, and the resolved values are saved in each run's `config.json`.
 
 | | value | note |

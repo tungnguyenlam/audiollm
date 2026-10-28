@@ -10,9 +10,13 @@ Track and compare training runs written by train.py (runs/<id>/config.json + sum
     python runs.py curve <run> [--every N] # val WER / train loss over steps from metrics.jsonl
     python runs.py plot [<run> ...]        # (re)write runs/<id>/plots.png (default: every run) + runs/INDEX.md
     python runs.py latest                  # path of the newest run (also always at runs/latest/)
+    python runs.py latest --model          # newest run with saved weights (also always at runs/latest_model/)
+    python runs.py best                    # best finished run per base LLM (by in-training val WER)
 
-<run> can be a path (runs/2026...), a run id, any unique substring of a run id, or "latest".
-train.py keeps runs/latest -> newest run dir, runs/INDEX.md (all runs, newest first) and runs/<id>/plots.png up to date.
+<run> can be a path (runs/2026...), a run id, any unique substring of a run id, "latest" or "latest_model".
+train.py keeps runs/latest -> newest run dir (may still be training, no weights yet), runs/latest_model -> newest run
+with saved weights (lora/ + proj.pt; --max_steps smoke runs excluded), runs/INDEX.md (all runs, newest first) and
+runs/<id>/plots.png up to date.
 """
 import argparse
 import json
@@ -65,10 +69,16 @@ def latest_run_dir():
     return runs[-1]["dir"] if runs else None
 
 
-def update_latest_link(run_dir):
-    """Point runs/latest -> <run_dir> (relative symlink), so the newest run is always at runs/latest/."""
-    link = RUNS_DIR / "latest"
-    tmp = RUNS_DIR / ".latest.tmp"
+def latest_model_dir():
+    """The most recently started run that has saved weights (proj.pt), whatever its status; --max_steps smoke runs skipped."""
+    runs = [run for run in all_runs() if (run["dir"] / "proj.pt").exists() and not run["meta"].get("max_steps")]
+    return runs[-1]["dir"] if runs else None
+
+
+def update_latest_link(run_dir, name="latest"):
+    """Point runs/<name> -> <run_dir> (relative symlink): runs/latest (newest run), runs/latest_model (newest weights)."""
+    link = RUNS_DIR / name
+    tmp = RUNS_DIR / f".{name}.tmp"
     tmp.unlink(missing_ok=True)
     tmp.symlink_to(Path(run_dir).name)
     tmp.replace(link)  # atomic swap
@@ -93,6 +103,9 @@ def write_index():
             f"| {bench_avg} | {run['meta'].get('notes') or summary.get('notes') or ''} |"
         )
     (RUNS_DIR / "INDEX.md").write_text("\n".join(lines) + "\n")
+    latest_model = latest_model_dir()
+    if latest_model is not None:
+        update_latest_link(latest_model, "latest_model")
 
 
 def refresh_run_views(run_dir, log=None):
@@ -104,11 +117,23 @@ def refresh_run_views(run_dir, log=None):
         (log or print)(f"warning: could not refresh plots/index for {run_dir}: {error!r}")
 
 
+def short_split_name(name):
+    """Legend label for a dev split: "ami_ihm/validation" -> "ami_ihm", "dev-clean" -> "dev-clean"."""
+    return name.split("/")[0]
+
+
 def plot_run(run_dir):
     """
-    Write <run_dir>/plots.png from metrics.jsonl + summary.json: train loss, grad norm (+ clip threshold), lr,
-    val WER (+ sub/del/ins, test WER), throughput and memory. Returns the path, or None if there is nothing to plot.
+    Write <run_dir>/plots.png from metrics.jsonl + summary.json as a 3-column grid:
+      row 1: train loss, grad norm (+ clip threshold), lr
+      row 2: val WER, exact-match rate, audio ablations (wer_shuffle / wer_zeros)
+      row 3: val sub, del, ins rates
+      row 4: throughput, memory, test + benchmark WERs
+    Every val panel has one line per dev split (VAL_SPLIT), in the same colour across panels.
+    Returns the path, or None if there is nothing to plot.
     """
+    import textwrap
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -124,10 +149,11 @@ def plot_run(run_dir):
         return None
     summary, cfg = run["summary"], run["config"]
     col = lambda rs, key: [r.get(key) for r in rs]
+    pct = lambda values: [None if v is None else 100 * v for v in values]
     steps = col(train, "step")
 
-    fig, axes = plt.subplots(2, 3, figsize=(17, 9))
-    (ax_loss, ax_gnorm, ax_lr), (ax_val, ax_speed, ax_mem) = axes
+    fig, axes = plt.subplots(4, 3, figsize=(16, 17))
+    (ax_loss, ax_gnorm, ax_lr), (ax_val, ax_exact, ax_ablate), (ax_sub, ax_del, ax_ins), (ax_speed, ax_mem, ax_test) = axes
 
     if train:
         loss = col(train, "loss")
@@ -151,7 +177,7 @@ def plot_run(run_dir):
         n_steps = len(train) * cfg.get("LOG_EVERY", 1)
         ax_gnorm.set_yscale("log")
         ax_gnorm.set_title(f"grad norm ({clipped}/{n_steps} steps clipped = {clipped / max(1, n_steps):.0%})")
-        ax_gnorm.legend()
+        ax_gnorm.legend(fontsize=8)
 
         ax_lr.plot(steps, col(train, "lr"))
         ax_lr.set_title(f"learning rate (peak {cfg.get('LR')}, warmup {cfg.get('WARMUP_STEPS')})")
@@ -163,33 +189,80 @@ def plot_run(run_dir):
         ax_mem.plot(steps, col(train, "peak_mem_gb"))
         ax_mem.set_title("peak GPU memory allocated (GB)")
 
+    # val rows carry their dev split; runs before 2026-10-28 had a single VAL_SPLIT and no "split" field
+    default_split = "train" if cfg.get("VAL_FROM_TRAIN") else cfg.get("VAL_SPLIT", "val")
+    by_split = {}
+    for r in val:
+        by_split.setdefault(r.get("split", default_split), []).append(r)
+    colors = {name: f"C{i}" for i, name in enumerate(by_split)}
+    best_step = summary.get("best_val_step")
+
+    def plot_val_metric(ax, key, title, marker="o-"):
+        drawn = False
+        for name, split_rows in by_split.items():
+            values = col(split_rows, key)
+            if any(v is not None for v in values):
+                ax.plot(col(split_rows, "step"), pct(values), marker, color=colors[name], label=short_split_name(name))
+                drawn = True
+        if drawn and best_step is not None:
+            ax.axvline(best_step, color="gray", ls=":", lw=1)
+        ax.set_title(title)
+        if drawn:
+            ax.legend(fontsize=8)
+        return drawn
+
     if val:
-        val_steps = col(val, "step")
-        ax_val.plot(val_steps, [100 * w for w in col(val, "wer")], "o-", lw=2, label="WER")
-        for key in ("sub", "del", "ins"):
-            if val[0].get(key) is not None:
-                ax_val.plot(val_steps, [100 * v for v in col(val, key)], ".--", alpha=0.7, label=key)
-        for key in ("wer_shuffle", "wer_zeros"):
-            if val[0].get(key) is not None:
-                ax_val.plot(val_steps, [100 * v for v in col(val, key)], "x:", alpha=0.8, label=key)
-        if summary.get("best_val_step") is not None:
-            ax_val.axvline(summary["best_val_step"], color="gray", ls=":", lw=1, label=f"best @ {summary['best_val_step']}")
-        for split, wer in summary.get("test_wer", {}).items():
-            ax_val.scatter([val_steps[-1]], [wer], marker="*", s=120, zorder=5, label=f"test {split} {wer:.2f}")
-        ax_val.set_title(f"val WER % on {cfg.get('VAL_SPLIT')}[:{cfg.get('VAL_N')}] (best {fmt(summary.get('best_val_wer'))})")
-        ax_val.legend(fontsize=8)
+        best_split = next(iter(by_split))
+        plot_val_metric(ax_val, "wer", f"val WER % (best {fmt(summary.get('best_val_wer'))} on "
+                                       f"{short_split_name(best_split)} @ {best_step})")
+        if not plot_val_metric(ax_exact, "exact", "val exact-match % (utts with WER 0)"):
+            ax_exact.text(0.5, 0.5, "not logged (runs before 2026-10-28)", ha="center", va="center", transform=ax_exact.transAxes)
+            ax_exact.axis("off")
+        plot_val_metric(ax_sub, "sub", "val substitution rate %", ".-")
+        plot_val_metric(ax_del, "del", "val deletion rate %", ".-")
+        plot_val_metric(ax_ins, "ins", "val insertion rate %", ".-")
+
+        drawn = False
+        for name, split_rows in by_split.items():
+            for key, marker in (("wer_shuffle", "x--"), ("wer_zeros", "+:")):
+                values = col(split_rows, key)
+                if any(v is not None for v in values):
+                    ax_ablate.plot(col(split_rows, "step"), pct(values), marker, color=colors[name],
+                                   label=f"{short_split_name(name)} {key[4:]}")
+                    drawn = True
+            if drawn:
+                ax_ablate.plot(col(split_rows, "step"), pct(col(split_rows, "wer")), "-", color=colors[name], alpha=0.35)
+        ax_ablate.set_title("WER % with shuffled / zeroed audio (faint = real audio)")
+        if drawn:
+            ax_ablate.legend(fontsize=8)
+        else:
+            ax_ablate.text(0.5, 0.5, "EVAL_AUDIO_ABLATIONS off", ha="center", va="center", transform=ax_ablate.transAxes)
+            ax_ablate.axis("off")
+
+    final = {**{f"test {k}": v for k, v in summary.get("test_wer", {}).items()},
+             **summary.get("benchmark", {}), **summary.get("benchmark_extra", {})}
+    if final:
+        names = list(final)[::-1]
+        bars = ax_test.barh(names, [final[n] for n in names], color=["C3" if n.startswith("test ") else "C0" for n in names])
+        ax_test.bar_label(bars, fmt="%.1f", fontsize=8, padding=2)
+        ax_test.set_title("final WER %: test splits (red) + benchmark (blue)")
+        ax_test.tick_params(axis="y", labelsize=8)
+    else:
+        ax_test.text(0.5, 0.5, "no test / benchmark yet", ha="center", va="center", transform=ax_test.transAxes)
+        ax_test.set_title("final WER %")
+        ax_test.axis("off")
 
     for ax in axes.flat:
-        ax.set_xlabel("optimizer step")
+        if ax is not ax_test:
+            ax.set_xlabel("optimizer step")
         ax.grid(alpha=0.3)
-    bench = {**summary.get("benchmark", {}), **summary.get("benchmark_extra", {})}
-    bench_text = ("  |  benchmark: " + ", ".join(f"{k} {v:.2f}" for k, v in bench.items())) if bench else ""
     overrides = {k: v for k, v in run["meta"].get("overrides", {}).items() if k not in IGNORED_KEYS}
+    override_text = textwrap.fill(f"{cfg.get('MODEL')} | overrides: "
+                                  + (", ".join(f"{k}={fmt(v)}" for k, v in overrides.items()) or "none"), 170)
     fig.suptitle(f"{run['id']}  [{summary['status']}"
                  + (f" {summary['step']}/{summary['total_steps']}" if "step" in summary else "") + "]\n"
-                 + f"{cfg.get('MODEL')} | overrides: {', '.join(f'{k}={fmt(v)}' for k, v in overrides.items()) or 'none'}"
-                 + bench_text, fontsize=10)
-    fig.tight_layout()
+                 + override_text, fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.009 * (override_text.count("\n") + 2)))  # room for the wrapped suptitle
     out = run["dir"] / "plots.png"
     fig.savefig(out, dpi=90)
     plt.close(fig)
@@ -226,10 +299,10 @@ def best_runs_by_model(runs=None):
 
 
 def resolve_run(name):
-    if name == "latest":
-        latest = latest_run_dir()
+    if name in ("latest", "latest_model"):
+        latest = latest_run_dir() if name == "latest" else latest_model_dir()
         if latest is None:
-            sys.exit(f"no runs in {RUNS_DIR}/")
+            sys.exit(f"no {'runs' if name == 'latest' else 'runs with saved weights'} in {RUNS_DIR}/")
         return load_run(latest)
     path = Path(name)
     if (path / "config.json").exists():
@@ -334,8 +407,9 @@ def cmd_curve(args):
     val_rows = [r for r in rows if r["type"] == "val"]
     if val_rows:
         print()
-        print_table(["step", "val WER", "sub", "del", "ins"],
-                    [[r["step"], *(f"{r[k] * 100:.2f}" for k in ("wer", "sub", "del", "ins"))] for r in val_rows])
+        print_table(["step", "split", "val WER", "sub", "del", "ins"],
+                    [[r["step"], short_split_name(r.get("split", run["config"].get("VAL_SPLIT", "val"))),
+                      *(f"{r[k] * 100:.2f}" for k in ("wer", "sub", "del", "ins"))] for r in val_rows])
 
 
 def cmd_plot(args):
@@ -344,6 +418,15 @@ def cmd_plot(args):
         print(plot_run(run["dir"]) or f"{run['id']}: no metrics.jsonl, nothing to plot")
     write_index()
     print(RUNS_DIR / "INDEX.md")
+
+
+def cmd_best(args):
+    rows = []
+    for model, (run, n_candidates) in best_runs_by_model().items():
+        summary = run["summary"]
+        test = ", ".join(f"{short_split_name(k)} {v:.2f}" for k, v in summary.get("test_wer", {}).items())
+        rows.append([model.split("/")[-1], run["id"], f"{summary['best_val_wer']:.2f}", test or "-", str(n_candidates)])
+    print_table(["model", "best run", "best val", "test", "candidates"], rows)
 
 
 def main():
@@ -362,10 +445,12 @@ def main():
     curve.add_argument("--every", type=int, default=1, help="print every Nth train row")
     plot = sub.add_parser("plot", help="write runs/<id>/plots.png (default: all runs) and runs/INDEX.md")
     plot.add_argument("runs", nargs="*")
-    sub.add_parser("latest", help="print the newest run dir")
+    latest = sub.add_parser("latest", help="print the newest run dir")
+    latest.add_argument("--model", action="store_true", help="newest run with saved weights instead")
+    sub.add_parser("best", help="best finished run per base LLM (lowest in-training val WER)")
     args = parser.parse_args()
-    {"show": cmd_show, "diff": cmd_diff, "curve": cmd_curve, "plot": cmd_plot,
-     "latest": lambda _: print(latest_run_dir())}.get(args.cmd, cmd_list)(args)
+    {"show": cmd_show, "diff": cmd_diff, "curve": cmd_curve, "plot": cmd_plot, "best": cmd_best,
+     "latest": lambda a: print(latest_model_dir() if a.model else latest_run_dir())}.get(args.cmd, cmd_list)(args)
 
 
 if __name__ == "__main__":

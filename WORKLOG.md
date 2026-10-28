@@ -212,3 +212,80 @@ Earlier months: `docs/worklog_archive/YYYY-MM.md`.
   - Audio tokens have median norm ~40 vs ~0.9 for text embeddings (44x; init `match_emb` was ~0.8), and cosine
     ~0.1-0.15 to their nearest vocab entry: a separate region of embedding space. Candidate experiment: norm
     penalty or an output LayerNorm on the projector.
+
+## 2026-10-28 - Warm-start continuation `mix544h_conv_stack8_cont19k` cuts `test-clean` WER in half (71.0% -> 36.8%)
+- Run: `runs/20261027-230948_mix544h_conv_stack8_cont19k` (`results/mel_20261027-230948_mix544h_conv_stack8_cont19k/summary.json`).
+- Config delta vs `20261027-150147_mix544h_conv_stack8`: `INIT_FROM` parent LoRA + `ConvAudioProjector`, +19,200 steps (~3.0 epochs) on the same 544.1 h mix, `LR=1e-4` (`PROJ_LR_MULT=2.5`), `WARMUP_STEPS=300`, `MIN_LR_RATIO=0.1`, `cap6+nr4` decode (`MAX_NEW_TOKENS=256`, `MAX_TOKENS_PER_SEC=6.0`, `NO_REPEAT_NGRAM_SIZE=4`).
+- Trajectory: `train_loss` `1.47 -> 0.380`; `dev-clean[:200]` WER `73.48% -> 36.60%` best @ step 19,000 (`sub 26.9 / del 4.2 / ins 5.4`, `wer_shuffle 105.22%`, 68.6-pt acoustic gap). LibriSpeech `test-clean` **36.83%** (`sub 26.35 / del 4.97 / ins 5.51`, vs 70.98% parent) and `test-other` **65.43%** (`sub 50.04 / del 7.44 / ins 7.94`, vs 85.38% parent).
+- 9-set benchmark (vs parent under identical `cap6+nr4` decode): Open ASR 7-set `mean_wer` **93.99% -> 76.83%** (-17.16 pts; -40.08 pts vs original 116.91%): `librispeech_clean` 71.29 -> **36.92**, `librispeech_other` 85.30 -> **66.18**, `ami` 77.72 -> **57.20**, `gigaspeech` (unseen) 92.25 -> **73.26**, `voxpopuli` 105.96 -> **94.18**, `spgispeech` 110.75 -> **103.36**, `earnings22` 114.66 -> **106.69**; extra: `fleurs_en` 107.84 -> **91.43**, `edacc` 97.73 -> **93.19**.
+- Rules IN: post-alignment optimization starvation (`MIN_LR_RATIO=0` after step ~3k ignition) was the primary bottleneck on LibriSpeech, AMI, and general read/podcast speech (`gigaspeech`), and `LFM2.5-230M` + `ConvAudioProjector` (`STACK=8`) has substantial headroom well below 40% clean WER without an audio encoder.
+- Rules IN: even at `train_loss=0.38`, unseen accented/spontaneous/telephony domains (`earnings22`, `spgispeech`, `voxpopuli`, `edacc`) and 1.4%-weight `fleurs_en` remain substitution-dominated (59-76% `sub`), isolating corpus coverage/balance as the remaining bottleneck (tested next by `20261028-055047_mix654h_rebal_conv_stack8_cont19k`).
+
+## 2026-10-28 - Log exact-match rate on validation
+- `evaluate_dataset()` now returns `exact` (fraction of utterances whose normalised hyp equals the ref), shown in
+  the `[val]`/`[test]` log line and in `metrics.jsonl`; `runs.plot_run()` draws it on a right-hand axis of the val panel.
+- Applies to runs started from now on; earlier runs did not save val hypotheses, so they can't be backfilled.
+- Note: in-training val is still `dev-clean[:200]` only (read LibriSpeech). `dev-other`, `ami_ihm/validation`
+  (13,098 utts) and `fleurs_en/validation` (394 utts) exist on disk but are not used, so val WER does not track the
+  AMI/FLEURS upweighting in `mix654h_rebal`.
+
+## 2026-10-28 - Validate on one dev set per training corpus
+- `VAL_SPLIT` is now a comma list scored separately; default `dev-clean,ami_ihm/validation,fleurs_en/validation`
+  (200 utts each: dev-clean = first 200 ids as before; AMI/FLEURS = SEED-fixed sample within [MIN_TRAIN_SEC,
+  MAX_TRAIN_SEC], AMI sample spans 18 meetings). Val rows in `metrics.jsonl` carry `split`; summary gets `val_wers`.
+- `best_val_wer` / best step still come from the first split (dev-clean), so they stay comparable with older runs.
+- Val cost ~3x per pass (plus ablations per split). `plots.png` val panels are now one per metric (WER, exact
+  match, ablations, sub/del/ins) with a line per dev split; `runs.py curve` shows a split column.
+
+## 2026-10-28 - Save val hypotheses per dev split and val pass
+- Each val pass now writes `runs/<id>/val_hyps/<split>/step_<N>.jsonl` (`{id, ref, hyp}` for all 200 utts,
+  ~50 KB; ~3 MB per 19k-step run with 3 dev splits). Test hyps were already saved in full (`runs/<id>/hyp_<split>.jsonl`,
+  benchmark sets in `results/mel_<id>/<set>.jsonl`).
+
+## 2026-10-28 - README: add model list, include LFM3-1.7B-Base
+- New `## Models` table in README.md: models used by runs (230M-Base, 350M-Base, 350M) and targets (2.6B-Base).
+- Added `LiquidAI/LFM3-1.7B-Base` (hidden 2048, 24 layers, released 2026-10-27) as untested. It ships custom code
+  (`Lfm3ForCausalLM` via `auto_map`), and `train.py` loads without `trust_remote_code`, so a run needs that flag
+  unless transformers adds native `lfm3`. Its tokenizer EOS is `<|im_end|>`, which is what gets appended to targets.
+
+## 2026-10-28 - Rebalanced continuation `mix654h_rebal_conv_stack8_cont19k` (AMI x2, FLEURS x6) loses across all 9 sets at fixed steps
+- Run: `runs/20261028-055047_mix654h_rebal_conv_stack8_cont19k` (`results/mel_20261028-055047_mix654h_rebal_conv_stack8_cont19k/summary.json`).
+- Config delta vs `20261027-230948_mix544h_conv_stack8_cont19k`: identical warm start (`INIT_FROM=20261027-150147_mix544h_conv_stack8`), 19,200 steps, `LR=1e-4`, `MIN_LR_RATIO=0.1`, `MVN_SPLIT`, and `cap6+nr4` decode, changing only `TRAIN_SPLIT` to `train-clean-100+train-clean-360+ami_ihm/train*2+fleurs_en/train*6` (653.7 weighted h/pass -> 2.15x LS, 4.29x AMI, 12.87x FLEURS vs 3.02x uniform in `cont19k`).
+- Trajectory & LibriSpeech test: `train_loss` `0.413` (vs `0.380`), `dev-clean[:200]` best WER **42.18%** @ step 19,000 (`wer_shuffle 105.69%`, vs `36.60%` in `cont19k`); `test-clean` **41.52%** (vs `36.83%`), `test-other` **68.59%** (vs `65.43%`).
+- 9-set benchmark vs `cont19k`: Open ASR 7-set `mean_wer` **79.91%** vs **76.83%** (+3.08 pts worse across every set, *including* the two upsampled corpora): `librispeech_clean` 41.71 (+4.79), `librispeech_other` 69.46 (+3.28), `ami` **60.09** vs 57.20 (+2.89), `fleurs_en` **94.79** vs 91.43 (+3.36, `sub` 68.98 vs 64.23), `gigaspeech` 76.50 (+3.24), `voxpopuli` 97.75 (+3.57), `earnings22` 108.35 (+1.66), `spgispeech` 105.50 (+2.14), `edacc` 94.39 (+1.20).
+- Rules OUT: reweighting the existing 544.1 h mix via corpus repetition (`*K`) as a fix for OOD/accented WER. Repeating 7.5 h FLEURS ~13x and noisy AMI ~4.3x while cutting clean, lexically rich LibriSpeech updates by 29% degrades general phonetic learning enough to hurt even `ami` and `fleurs_en` test sets.
+- Rules IN: adding *unique* diverse hours (not repeating 2.6k FLEURS clips) while preserving clean phonetic step budget.
+
+## 2026-10-28 - Refactor: `train.py` split into the `audiollm/` package (projector classes, SpeechLLM, trainer)
+- `train.py` is now a thin CLI over `audiollm/`: `config.py` (same flat UPPERCASE keys, so old `config.json`, `runs.py`
+  diffs and `INIT_FROM` keep working), `data.py`, `features.py`, `projectors/` (`linear`/`mlp`/`conv`, one class each,
+  `@register_projector`), `backbone.py`, `model.py` (`SpeechLLM`), `trainer.py`, `evaluate.py`, `tracking.py`.
+- Stacking moved out of the dataset into the projectors: the dataset emits 100 Hz frames, projectors run batched and
+  return `ProjectorOutput(embeds, lengths per utterance, aux_loss, stats)`, ready for variable-rate projectors.
+- Old `proj.pt` files load unchanged (legacy key prefix). Verified on CPU fp32 vs the pre-refactor code: same seeded
+  init; batched projectors equal per-utterance ones to <1e-7 for all 3 projectors x STACK 4/8/16; a 4-step conv run
+  gives the same loss at every step (6 decimals), identical val hyps, `proj.pt` diff 3e-7; `benchmark.py` hyps identical.
+- New: model summary (LLM shape, params per component, trainable/dtype, projector layers) logged at start, saved as
+  `model_summary.txt`, counts in `summary.json`; `runs/latest_model` -> newest run with weights, `runs.py best`,
+  `runs.py latest --model`; `--batch_tokens N` token-budget batching (default 0 = off, unchanged behaviour).
+- Small behaviour change: val/test decode budgets use the true utterance duration (as benchmark.py already did)
+  instead of the STACK-padded one (<= 1 token of cap difference).
+- Notebooks: `import train as T` still reaches config + functions, but cells using old signatures
+  (`T.SpeechDataset(items, mvn, tok)`, `T.build_multimodal_inputs`, `T.ConvAudioProjector(M, S, H)`) need updating.
+
+## 2026-10-28 - 100 h vs 544 h cold-start ablation (`ls100h_conv_stack8_12768`): `ConvAudioProjector` ignites on 100 h, data volume prevents transcript memorization
+- Run: `runs/20261028-103311_ls100h_conv_stack8_12768` (`summary.json`).
+- Config delta vs `20261027-150147_mix544h_conv_stack8`: identical `LFM2.5-230M-Base`, `PROJECTOR="conv"`, `STACK=8`, `LR=2e-4` (`PROJ_LR_MULT=2.5`), `WARMUP_STEPS=500`, `MIN_LR_RATIO=0`, and 12,768 steps, changing only `TRAIN_SPLIT="train-clean-100"` (100.6 h / 28,539 utts -> 14.31 epochs vs 2.00 epochs on 544.1 h) plus `cap6+nr4` decode.
+- Trajectory & test WER: hits the exact same cold-start plateau (`proj_grad_norm_avg` `0.26` @ steps 1k-1.5k, `WER ~ wer_shuffle`), then ignites at steps 2.5k-3.5k (`proj_grad_norm_avg` jumps `0.26 -> 1.18` @ 5k; `dev-clean[:200]` WER `97.2%` vs `wer_shuffle 107.3%` @ 3.5k -> best **82.03%** vs `wer_shuffle 104.73%` @ 11.5k). However, from step 7k to 12.7k (epochs 8-14), `train_loss` collapses `0.638 -> 0.035` (`ppl 1.04`) while `val` WER flatlines at 82-83%. Final LibriSpeech `test-clean` **84.00%** (`sub 64.22 / del 11.87 / ins 7.91`, vs **70.98%** on 544 h @ 12.7k and **36.83%** @ 32k) and `test-other` **91.42%** (vs **85.38%** / **65.43%**).
+- Rules IN (`ConvAudioProjector` + >=3k steps): breaking the 120% wall is an optimization + projector inductive-bias threshold (~3k steps with `conv` `STACK=8`), *not* something requiring >100 h to trigger (earlier 100 h runs used `linear`/`mlp` or stopped <=4.5k steps).
+- Rules IN (data scale): once aligned, 100 h (28.5k utts) is memorized by the 230M LLM + 15.5M LoRA within ~8 epochs (`loss -> 0.035`), capping clean WER at 84%. Scaling unique utterances (544 h -> >1,000 h) is what converts post-ignition steps into phonetic generalization (84.0% -> 71.0% -> 36.8%).
+
+## 2026-10-28 - Refactor verified on GPU; notebooks committed without outputs; smoke runs excluded from `runs/latest_model`
+
+- GPU smoke of the `audiollm/` refactor (`20261028-145754_gpu_smoke_refactor_smoke50`, defaults, bf16): 50 steps in
+  1:05, loss 5.60 -> 4.80, val on 3 dev sets ran, weights saved. With the earlier CPU fp32 old-vs-new equivalence
+  checks, this is the go-ahead to commit the refactor.
+- `.gitattributes` + `tools/strip_notebook_outputs.py` (git clean filter): committed `*.ipynb` lose outputs, execution
+  counts and `language_info` run metadata; working copies keep their outputs. Per-clone setup is in README.
+  History check: no commit so far contained notebook outputs.
+- `runs/latest_model` skips `--max_steps` smoke runs (they save weights and were taking the link over).

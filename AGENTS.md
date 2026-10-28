@@ -23,5 +23,6 @@ grep -n -i 'projector' WORKLOG.md docs/worklog_archive/*.md | tail   # older his
 
 ## Repository
 
-Encoder-free Mel -> LLM ASR baseline (`train.py`, `benchmark.py`, `runs.py`). See `README.md`.
+Encoder-free Mel -> LLM ASR baseline: CLI scripts `train.py`, `benchmark.py`, `runs.py` over the `audiollm/` package
+(config, data, features, projectors, backbone, model, trainer). See `README.md` ("Code layout").
 Runtime artifacts (`data/`, `runs/`, `results/`) are gitignored; never commit them.

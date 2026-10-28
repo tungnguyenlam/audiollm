@@ -56,7 +56,7 @@ LOCAL_SETS = {
     "edacc": ("data/corpora/edacc/data/test-*.parquet", "text"),  # accented conversational English, never trained on
 }
 ALL_SETS = OPENASR_SETS + list(LOCAL_SETS)
-DECODE_KEYS = ("MAX_NEW_TOKENS", "MAX_TOKENS_PER_SEC", "NO_REPEAT_NGRAM_SIZE")  # train.py constants used by mel: decoding
+DECODE_KEYS = ("MAX_NEW_TOKENS", "MAX_TOKENS_PER_SEC", "NO_REPEAT_NGRAM_SIZE")  # audiollm/config.py keys used by mel: decoding
 
 # Table II of arXiv 2606.10231 (WER %). Their Avg also includes TED-LIUM, so only compare per-set columns.
 PAPER = {
@@ -123,40 +123,31 @@ def read_wav(b, target_sr=16000):
 
 # ---------------------------------------------------------------- models
 class MelLLM:
-    """Our encoder-free checkpoint. Reuses train.py, with its constants overridden from the run's config.json."""
+    """Our encoder-free checkpoint (audiollm.SpeechLLM), with the config overridden from the run's config.json."""
 
     def __init__(self, run_dir, batch_size, loaded=None):
-        """loaded: optional (tokenizer, model, projector) already in memory (train.py benchmarking right after
-        training), otherwise they are loaded from run_dir."""
-        import train
-        config = json.load(open(Path(run_dir, "config.json")))
-        config.setdefault("PRECISION", "fp32")  # runs from before PRECISION existed trained fp32 LoRA/projector
-        config.setdefault("PROJ_INIT", "default")
-        config.setdefault("MIN_TRAIN_SEC", 0.0)
-        config.setdefault("PROJECTOR", "linear")
-        train.apply_config(config)
-        self.t = train
+        """loaded: optional SpeechLLM already in memory (train.py benchmarking right after training), otherwise it is
+        loaded from run_dir."""
+        from audiollm import config as C
+        from audiollm.features import LogMelFeaturizer, mvn_cache_path
+        from audiollm.model import SpeechLLM
+        C.apply_config(C.with_legacy_defaults(json.load(open(Path(run_dir, "config.json")))))
+        self.t = C  # the live config: decoding overrides are set on it
         self.run_dir = Path(run_dir)
-        self.tok, self.model, self.proj = loaded or train.load_model_and_projector(run_dir)
+        self.model = loaded or SpeechLLM.load(run_dir)
         self.model.eval()
-        self.mvn = torch.load(train.mvn_cache_path())
-        self.prompt_ids = self.tok(train.PROMPT, add_special_tokens=False).input_ids
-        self.batch_size = batch_size or train.EVAL_BATCH_SIZE
-
-    def features(self, b):
-        t = self.t
-        x = (t.log_mel_from_waveform(read_wav(b, t.SR)) - self.mvn["mean"]) / self.mvn["std"]
-        x = torch.cat([x, x.new_zeros((-x.shape[0]) % t.STACK, t.N_MELS)])
-        return x.reshape(-1, t.STACK * t.N_MELS)
+        self.featurizer = LogMelFeaturizer(torch.load(mvn_cache_path()))
+        self.batch_size = batch_size or C.EVAL_BATCH_SIZE
 
     @torch.no_grad()
     def transcribe(self, batch):
-        t = self.t
-        feats = [{"audio": self.features(it["bytes"])} for it in batch]
-        with t.compute_context():
-            x, mask, _ = t.build_multimodal_inputs(feats, self.model, self.proj, self.tok, self.prompt_ids,
-                                                   is_train=False)
-            return t.generate_transcripts(self.model, self.tok, x, mask, audio_seconds=[it["sec"] for it in batch])
+        from audiollm.data import collate_speech_batch
+        from audiollm.utils import compute_context
+        items = [{"features": self.featurizer.from_waveform(read_wav(it["bytes"], self.t.SR)), "target": [],
+                  "text": it["text"], "id": it["id"], "sec": it["sec"]} for it in batch]
+        with compute_context():
+            hypotheses, _ = self.model.transcribe(collate_speech_batch(items))
+        return hypotheses
 
 
 class HFPipeline:
@@ -330,7 +321,7 @@ def print_table(all_runs=False):
     if not best:
         print(f"\nno finished training runs in {runs_lib.RUNS_DIR}/ yet")
         return
-    import train  # only for the defaults, to mark which config values a run changed
+    from audiollm import config as C  # only for the defaults, to mark which config values a run changed
     print("\n## Best run per base LLM (selected by in-training val WER; test sets are never used for selection)")
     for model, (run, n_candidates) in best.items():
         summary, meta = run["summary"], run["meta"]
@@ -350,7 +341,7 @@ def print_table(all_runs=False):
         if meta.get("git_commit"):
             print(f"- git: {meta['git_commit'][:10]}{' (dirty)' if meta.get('git_dirty') else ''}")
         items = [
-            f"{key}={runs_lib.fmt(val)}" + ("*" if train.DEFAULT_CONFIG.get(key, val) != val else "")
+            f"{key}={runs_lib.fmt(val)}" + ("*" if C.DEFAULT_CONFIG.get(key, val) != val else "")
             for key, val in cfg.items() if key not in runs_lib.IGNORED_KEYS
         ]
         if "PRECISION" not in cfg:
