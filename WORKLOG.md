@@ -344,3 +344,12 @@ Earlier months: `docs/worklog_archive/YYYY-MM.md`.
   27/80 mel bins removes the signal the projector needs to align in the first place. Rules out SpecAugment from step 0
   as the 100 h fix. Untested: milder policy, or turning it on only after alignment (warm start).
 - The queue went on to B `mix1040h_conv_stack8_cont2_19k` (+train-other-500), then C (544 h control).
+
+## 2026-10-28 - Parked idea: loss-based soft data pruning (InfoBatch-style)
+- Reviewed BLS (arXiv:2604.04681, EMA of batch loss as a per-sample score): rejected. The per-sample signal is
+  1/B of the batch loss and the noise dominates. It also lacks a random-score control, and per-utterance CE is free here anyway.
+- Parked instead: skip below-corpus-mean-loss utterances with prob r per epoch, reweight kept ones by 1/(1-r),
+  no pruning in the last ~12.5% of steps. Selection cost is negligible.
+- Not now: ~3-epoch runs would save only ~14% (epoch 1 is unscored), and data volume, not compute, is our lever.
+  Best testbed is the ~14-epoch 100 h config. Planned arms: baseline / real loss / random scores.
+- Design, implementation sketch and verified citations: `docs/idea_loss_based_soft_pruning.md`.
