@@ -2,6 +2,7 @@
 import json
 import math
 import random
+import shutil
 import time
 
 import numpy as np
@@ -12,7 +13,7 @@ from audiollm import config as C
 from audiollm.data import (SpeechDataset, create_dataloader, create_length_batched_sampler,
                            create_token_batched_sampler, load_train_items, load_validation_items, parse_val_splits)
 from audiollm.evaluate import evaluate_dataset, format_eval_metrics, run_test_evaluation, val_hypotheses_path
-from audiollm.features import LogMelFeaturizer, SpecAugment, compute_or_load_mvn_stats
+from audiollm.features import LogMelFeaturizer, SpecAugment, compute_or_load_mvn_stats, load_run_mvn_stats
 from audiollm.model import SpeechLLM
 from audiollm.utils import compute_context, format_duration, make_progress_bar
 
@@ -71,13 +72,60 @@ def estimate_sequence_lengths(train_items, model, frame_rate):
             for item, n_text in zip(train_items, text_lengths)]
 
 
-def train(args, run_dir, tracker, log_and_print):
-    """Full training loop + final test eval. Writes metrics to tracker and checkpoints to run_dir."""
+def rng_state():
+    return {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+
+
+def set_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def save_checkpoint(checkpoint_dir, model, optimizer, lr_scheduler, loop_state):
+    """
+    Resumable checkpoint: checkpoint/{lora/, proj.pt} (same layout as a run dir, so SpeechLLM.load reads it) +
+    trainer_state.pt (optimizer, LR schedule, loop counters, RNG). Written to checkpoint.tmp/ and swapped in, so a
+    crash mid-save leaves the previous checkpoint intact.
+    """
+    tmp_dir, old_dir = checkpoint_dir.with_name("checkpoint.tmp"), checkpoint_dir.with_name("checkpoint.old")
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True)
+    model.save(tmp_dir)
+    torch.save({**loop_state, "optimizer": optimizer.state_dict(), "lr_scheduler": lr_scheduler.state_dict(),
+                "rng": rng_state()}, tmp_dir / "trainer_state.pt")
+    if checkpoint_dir.exists():
+        checkpoint_dir.rename(old_dir)
+    tmp_dir.rename(checkpoint_dir)
+    shutil.rmtree(old_dir, ignore_errors=True)
+
+
+def drop_metrics_after(run_dir, step):
+    """Remove metrics.jsonl rows logged after the checkpoint step: the resumed run logs those steps again."""
+    metrics_path = run_dir / "metrics.jsonl"
+    if metrics_path.exists():
+        rows = metrics_path.read_text().splitlines()
+        metrics_path.write_text("".join(row + "\n" for row in rows if json.loads(row).get("step", 0) <= step))
+
+
+def train(args, run_dir, tracker, log_and_print, hub=None):
+    """
+    Full training loop + final test eval. Writes metrics to tracker and checkpoints to run_dir; args.resume continues
+    from run_dir/checkpoint/. hub (audiollm.hub.HubSync or None) gets the run dir pushed after every checkpoint.
+    """
     log_and_print(f"model {C.MODEL} | device {torch.cuda.get_device_name(0)} | dtype {C.DTYPE} | precision {C.PRECISION}")
 
     # Load dataset splits
     train_items = load_train_items()
-    mvn_stats = compute_or_load_mvn_stats(train_items)  # always from the full split, so TRAIN_N runs share the cache
+    # Always from the full split, so TRAIN_N runs share the cache; a copy in the run dir makes it portable (Hub, Colab)
+    if args.resume and (run_dir / "mvn.pt").exists():
+        mvn_stats = load_run_mvn_stats(run_dir)
+    else:
+        mvn_stats = compute_or_load_mvn_stats(train_items)
+        torch.save(mvn_stats, run_dir / "mvn.pt")
     featurizer = LogMelFeaturizer(mvn_stats)
     if C.TRAIN_N:
         train_items = sorted(random.Random(C.SEED).sample(train_items, C.TRAIN_N), key=lambda it: it["id"])
@@ -98,8 +146,13 @@ def train(args, run_dir, tracker, log_and_print):
     )
 
     # Backbone + projector -> one trainable model
-    model = SpeechLLM.load(C.INIT_FROM or None, trainable=True)
-    if C.INIT_FROM:
+    checkpoint_dir = run_dir / "checkpoint"
+    if args.resume and not (checkpoint_dir / "trainer_state.pt").exists():
+        raise SystemExit(f"--resume {run_dir}: no checkpoint/trainer_state.pt (was CHECKPOINT_EVERY set?)")
+    model = SpeechLLM.load(checkpoint_dir if args.resume else (C.INIT_FROM or None), trainable=True)
+    if args.resume:
+        log_and_print(f"resume: LoRA + projector weights from {checkpoint_dir}")
+    elif C.INIT_FROM:
         log_and_print(f"init: LoRA + projector weights from {C.INIT_FROM} (fresh optimizer and LR schedule)")
     if C.GRAD_CKPT:
         model.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -147,8 +200,20 @@ def train(args, run_dir, tracker, log_and_print):
 
     optimizer_step = 0
     micro_step = 0
-    train_start_time = time.time()
+    start_epoch, start_epoch_batches = 0, 0
     best_val_wer, best_val_step = float("inf"), None
+    if args.resume:
+        state = torch.load(checkpoint_dir / "trainer_state.pt", map_location="cpu", weights_only=False)
+        optimizer.load_state_dict(state["optimizer"])
+        lr_scheduler.load_state_dict(state["lr_scheduler"])
+        optimizer_step, micro_step = state["optimizer_step"], state["micro_step"]
+        start_epoch, start_epoch_batches = state["epoch"], state["epoch_batches_done"]
+        best_val_wer, best_val_step = state["best_val_wer"], state["best_val_step"]
+        drop_metrics_after(run_dir, optimizer_step)
+        log_and_print(f"resume: step {optimizer_step}/{total_optimizer_steps}, epoch {start_epoch + 1} batch "
+                      f"{start_epoch_batches}, best val {best_val_wer * 100:.2f} @ {best_val_step}")
+    resumed_step = optimizer_step
+    train_start_time = time.time()
 
     # Per-logging-window accumulators (reset every LOG_EVERY optimizer steps)
     def reset_window_stats():
@@ -161,16 +226,25 @@ def train(args, run_dir, tracker, log_and_print):
     window = reset_window_stats()
     step_loss_sum = 0.0  # loss summed over the micro-batches of the current optimizer step (for the bar)
 
-    progress_bar = make_progress_bar(total=total_optimizer_steps, desc="train", unit="step")
+    progress_bar = make_progress_bar(total=total_optimizer_steps, initial=optimizer_step, desc="train", unit="step")
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         epoch_sampler = make_epoch_sampler(train_items, sequence_lengths, epoch)
-        dataloader = create_dataloader(train_dataset, epoch_sampler)
+        # A resumed epoch skips the batches it already trained on (the sampler is a pure function of SEED + epoch)
+        epoch_batches_done = start_epoch_batches if epoch == start_epoch else 0
+        dataloader = create_dataloader(train_dataset, epoch_sampler[epoch_batches_done:])
         progress_bar.set_description(f"train ep {epoch + 1}/{num_epochs}")
 
+        batch_iterator = iter(dataloader)  # draws the workers' base seed from the torch RNG
+        if args.resume and epoch == start_epoch:
+            # The checkpoint's RNG state was saved after this epoch's iterator was created, so restore it only now:
+            # dropout then continues exactly as in an uninterrupted run (SpecAugment masks, drawn in workers, differ)
+            set_rng_state(state["rng"])
+
         data_wait_start = time.time()
-        for batch in dataloader:
+        for batch in batch_iterator:
             window["data_wait_sec"] += time.time() - data_wait_start
+            epoch_batches_done += 1
 
             with compute_context():
                 loss, aux = model(batch)
@@ -227,7 +301,7 @@ def train(args, run_dir, tracker, log_and_print):
                 average_loss = window["loss_sum"] / window["micro_steps"]
                 grad_norms = window["grad_norms"]
                 total_elapsed = time.time() - train_start_time
-                eta_seconds = total_elapsed / optimizer_step * (total_optimizer_steps - optimizer_step)
+                eta_seconds = total_elapsed / (optimizer_step - resumed_step) * (total_optimizer_steps - optimizer_step)
                 epoch_progress = micro_step / len(epoch_sampler)  # fractional epochs completed (all epochs)
                 num_clipped = sum(norm > C.GRAD_CLIP for norm in grad_norms)
                 proj_stats = {f"proj_{key}": val / window["micro_steps"] for key, val in window["proj_stats"].items()}
@@ -312,6 +386,19 @@ def train(args, run_dir, tracker, log_and_print):
                 )
                 runs_lib.refresh_run_views(run_dir, log_and_print)
                 window = reset_window_stats()  # exclude eval time from training throughput
+
+            if C.CHECKPOINT_EVERY and optimizer_step % C.CHECKPOINT_EVERY == 0 and optimizer_step < total_optimizer_steps:
+                if hub:
+                    hub.wait()  # the upload reads checkpoint/, which save_checkpoint is about to replace
+                save_checkpoint(checkpoint_dir, model, optimizer, lr_scheduler, {
+                    "optimizer_step": optimizer_step, "micro_step": micro_step, "epoch": epoch,
+                    "epoch_batches_done": epoch_batches_done, "best_val_wer": best_val_wer, "best_val_step": best_val_step,
+                })
+                tracker.update(checkpoint_step=optimizer_step)
+                log_and_print(f"checkpoint: step {optimizer_step} -> {checkpoint_dir}")
+                if hub:
+                    runs_lib.refresh_run_views(run_dir, log_and_print)
+                    hub.push(f"step {optimizer_step}")
 
             if optimizer_step >= total_optimizer_steps:
                 break

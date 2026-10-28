@@ -12,6 +12,7 @@ Track and compare training runs written by train.py (runs/<id>/config.json + sum
     python runs.py latest                  # path of the newest run (also always at runs/latest/)
     python runs.py latest --model          # newest run with saved weights (also always at runs/latest_model/)
     python runs.py best                    # best finished run per base LLM (by in-training val WER)
+    python runs.py pull <repo> <run_id>    # download a run mirrored by train.py --hub_repo into runs/<run_id>/
 
 <run> can be a path (runs/2026...), a run id, any unique substring of a run id, "latest" or "latest_model".
 train.py keeps runs/latest -> newest run dir (may still be training, no weights yet), runs/latest_model -> newest run
@@ -30,7 +31,7 @@ import numpy as np
 RUNS_DIR = Path("runs")
 # Config keys that are bookkeeping rather than hyperparameters; never shown as "differing" columns.
 IGNORED_KEYS = {"RUN_NAME", "NUM_WORKERS", "LOG_EVERY", "LOG_N_EXAMPLES", "DEVICE", "EVAL_BATCH_SIZE", "PLOT_EVERY",
-                "BENCHMARK_SETS", "ASR_CORPORA", "EVAL_AUDIO_ABLATIONS"}
+                "BENCHMARK_SETS", "ASR_CORPORA", "EVAL_AUDIO_ABLATIONS", "CHECKPOINT_EVERY", "HUB_REPO"}
 
 
 def load_run(run_dir):
@@ -439,6 +440,17 @@ def cmd_best(args):
     print_table(["model", "best run", "best val", "test", "candidates"], rows)
 
 
+def cmd_pull(args):
+    """Download <repo>/<run_id>/ (mirrored by train.py --hub_repo) into runs/<run_id>/, e.g. to --resume or evaluate it."""
+    from huggingface_hub import snapshot_download
+    snapshot_download(args.repo, repo_type="model", allow_patterns=[f"{args.run_id}/*"], local_dir=RUNS_DIR)
+    run_dir = RUNS_DIR / args.run_id
+    if not (run_dir / "config.json").exists():
+        sys.exit(f"{args.repo} has no {args.run_id}/config.json")
+    state = "checkpoint/ (resumable)" if (run_dir / "checkpoint").exists() else "no checkpoint/"
+    print(f"{run_dir}: {state}, final weights {'yes' if (run_dir / 'proj.pt').exists() else 'no'}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-f", "--filter", help="only runs whose id contains this substring")
@@ -458,8 +470,11 @@ def main():
     latest = sub.add_parser("latest", help="print the newest run dir")
     latest.add_argument("--model", action="store_true", help="newest run with saved weights instead")
     sub.add_parser("best", help="best finished run per base LLM (lowest in-training val WER)")
+    pull = sub.add_parser("pull", help="download a run mirrored to the HF Hub (train.py --hub_repo) into runs/")
+    pull.add_argument("repo", help="Hub model repo, e.g. user/audiollm-runs")
+    pull.add_argument("run_id")
     args = parser.parse_args()
-    {"show": cmd_show, "diff": cmd_diff, "curve": cmd_curve, "plot": cmd_plot, "best": cmd_best,
+    {"show": cmd_show, "diff": cmd_diff, "curve": cmd_curve, "plot": cmd_plot, "best": cmd_best, "pull": cmd_pull,
      "latest": lambda a: print(latest_model_dir() if a.model else latest_run_dir())}.get(args.cmd, cmd_list)(args)
 
 

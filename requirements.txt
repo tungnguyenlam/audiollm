@@ -1,0 +1,16 @@
+# Python deps besides torch. torch comes from the platform: ROCm wheel via ./setup_rocm.sh, CUDA wheel preinstalled
+# on Colab (or `pip install torch`). Versions = the ones the runs in WORKLOG.md were trained with.
+transformers==5.20.2
+peft==0.21.2
+accelerate==1.15.0
+safetensors==0.8.0
+huggingface_hub==2.3.0
+soundfile==0.14.0
+soxr==1.1.0
+numpy==2.5.4
+jiwer==4.0.0
+pyarrow==26.0.0
+matplotlib==3.11.2
+tqdm==4.70.1
+# Optional: fused kernel for LFM2's short convs (transformers falls back to PyTorch without it).
+# CUDA: `pip install causal-conv1d`; ROCm: built from source by setup_rocm.sh.

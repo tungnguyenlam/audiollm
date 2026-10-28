@@ -129,14 +129,14 @@ class MelLLM:
         """loaded: optional SpeechLLM already in memory (train.py benchmarking right after training), otherwise it is
         loaded from run_dir."""
         from audiollm import config as C
-        from audiollm.features import LogMelFeaturizer, mvn_cache_path
+        from audiollm.features import LogMelFeaturizer, load_run_mvn_stats
         from audiollm.model import SpeechLLM
         C.apply_config(C.with_legacy_defaults(json.load(open(Path(run_dir, "config.json")))))
         self.t = C  # the live config: decoding overrides are set on it
         self.run_dir = Path(run_dir)
         self.model = loaded or SpeechLLM.load(run_dir)
         self.model.eval()
-        self.featurizer = LogMelFeaturizer(torch.load(mvn_cache_path()))
+        self.featurizer = LogMelFeaturizer(load_run_mvn_stats(run_dir))
         self.batch_size = batch_size or C.EVAL_BATCH_SIZE
 
     @torch.no_grad()

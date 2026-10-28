@@ -114,6 +114,12 @@ def compute_or_load_mvn_stats(dataset_items):
     return mvn_stats
 
 
+def load_run_mvn_stats(run_dir):
+    """A run's MVN stats: runs/<id>/mvn.pt (saved since 2026-10-28, travels with the run), else the data/ cache."""
+    run_copy = Path(run_dir, "mvn.pt")
+    return torch.load(run_copy if run_copy.exists() else mvn_cache_path())
+
+
 class LogMelFeaturizer:
     """
     MVN-normalised 80-d HTK log-mel at 100 Hz (SR, N_FFT, HOP, N_MELS). The single featurizer for now; a new one

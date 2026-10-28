@@ -81,6 +81,36 @@ Precedence: explicit flags > `--config` file > constants in `audiollm/config.py`
 (utterances × longest `[BOS][audio][prompt][text][EOS]` in the batch), so short utterances come in big batches and
 long ones in small batches.
 
+## Checkpoints, resume and the Hugging Face Hub (Colab)
+
+`--checkpoint_every N` saves a resumable checkpoint every N optimizer steps to `runs/<id>/checkpoint/`, replacing
+the previous one. It holds LoRA, the projector, the optimizer and LR schedule, the data position and the RNG state.
+`python train.py --resume runs/<id>` continues the run in the same directory with the same config. Losses after a
+resume match an uninterrupted run exactly (tested with a hard kill). The one exception is SpecAugment masks, which
+are drawn in DataLoader workers. `checkpoint/` is deleted once the run finishes.
+
+`--hub_repo user/name` mirrors `runs/<id>/` to `<repo>/<id>/` in that model repo, which is created private if
+missing. The mirror is pushed after every checkpoint and at the end. Uploads run in the background, and a failed
+upload is logged without stopping training. Since `plots.png`, `metrics.jsonl` and `log.txt` go up too, the repo
+page doubles as a remote monitor. The final push removes `checkpoint/` from the Hub copy.
+`python runs.py pull user/name <run_id>` downloads a run back into `runs/<run_id>/` to resume, evaluate or benchmark.
+
+Colab (needs a GPU with bf16, e.g. L4/A100):
+
+```bash
+git clone <this repo> audiollm && cd audiollm
+pip install -r requirements.txt causal-conv1d      # torch (CUDA) is preinstalled
+hf auth login                                      # token with write access, for --hub_repo
+./setup_dataset.sh --no-esb --no-corpora           # LibriSpeech to local disk (not Drive: too slow for ~280k small files)
+python train.py --checkpoint_every 500 --hub_repo user/audiollm-runs --model LiquidAI/LFM2.5-1.2B-Base ...
+# new session after a disconnect:
+python runs.py pull user/audiollm-runs <run_id> && python train.py --resume runs/<run_id>
+```
+
+Each Hub upload holds LoRA, the projector and AdamW states, which is about 200 MB for the 230M model with r64. Training
+waits for the previous upload before it writes the next checkpoint. Choose `--checkpoint_every` so an upload fits
+in the interval (500 steps is several minutes).
+
 ## Run tracking
 
 Each training run gets a fresh directory `runs/<YYYYmmdd-HHMMSS>_<run_name>/` (never overwritten). The default

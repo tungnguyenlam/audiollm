@@ -314,3 +314,18 @@ Earlier months: `docs/worklog_archive/YYYY-MM.md`.
 - Plots already drew one line per dev split. ls100h_* runs show a single line only because their VAL_SPLIT is just
   dev-clean (inherited from the mix544h config).
 - Existing run dirs renamed (val_hyps/*, hyp_*.jsonl) and all plots redrawn. The SpecAugment run is renamed when it exits.
+
+## 2026-10-28 - Resumable checkpoints + HF Hub run mirror (Colab prep)
+- `--checkpoint_every N` saves `runs/<id>/checkpoint/` (LoRA, projector, optimizer, LR schedule, loop position, RNG),
+  written atomically and deleted at the end. `train.py --resume runs/<id>` continues in the same run dir and drops
+  metrics rows logged after the checkpoint.
+- Test (CPU, 230M, 8 steps, checkpoint every 3, `kill -9` at step 5, resume): every per-step loss and the final val
+  WER are identical to the uninterrupted run. Found and fixed on the way: the RNG has to be restored after the epoch's
+  DataLoader iterator is created; otherwise dropout masks shift.
+- `--hub_repo user/name` mirrors the run dir to a private model repo after every checkpoint and at the end, in the
+  background. Failures are only logged. `runs.py pull <repo> <run_id>` downloads a run back. Round trip tested:
+  kill, delete the local dir, pull, resume, final push (Hub copy keeps lora/ + proj.pt and drops checkpoint/).
+  An upload in flight at the kill is lost, so the previous checkpoint is used.
+- Each run now saves its MVN stats as `runs/<id>/mvn.pt`; eval/benchmark/resume prefer that copy over the data/ cache.
+- `requirements.txt` (pinned, torch excluded) and a Colab section in the README. No wandb: the Hub mirror already
+  carries plots.png / metrics.jsonl / log.txt.

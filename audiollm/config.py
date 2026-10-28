@@ -113,6 +113,8 @@ NO_REPEAT_NGRAM_SIZE = 4     # >0: forbid repeating any n-gram of this size in a
 NUM_WORKERS = 8              # Number of DataLoader worker processes
 LOG_N_EXAMPLES = 2           # Number of (ref, hyp) examples printed after each validation pass
 PLOT_EVERY = 100             # Re-draw runs/<id>/plots.png (+ runs/INDEX.md) every N optimizer steps and after each val
+CHECKPOINT_EVERY = 0         # >0: every N optimizer steps, save a resumable checkpoint (LoRA + projector + optimizer + LR schedule + data position + RNG) to runs/<id>/checkpoint/, replacing the previous one; continue with `train.py --resume runs/<id>`. Deleted once the run finishes
+HUB_REPO = ""                # Hugging Face Hub model repo ("user/name", created private if missing) that runs/<id>/ is mirrored to as <repo>/<id>/ at every checkpoint and at the end; pull it back with `runs.py pull`. "" = off
 BENCHMARK_SETS = "all"       # After training + test eval, run benchmark.py with the in-memory model: "all" (7 Open ASR sets + local fleurs_en/edacc test sets), "openasr", comma list (e.g. "librispeech_clean,ami") or "none"
 
 DEVICE = "cuda"              # Compute device (cuda or cpu)
@@ -196,6 +198,8 @@ def build_arg_parser():
     run_group.add_argument("--max_steps", type=int, default=None, help="Cap optimizer steps (for smoke tests)")
     run_group.add_argument("--eval_only", type=str, default=None,
                            help="Run directory to evaluate without training (loads its config.json)")
+    run_group.add_argument("--resume", type=str, default=None,
+                           help="Run directory to continue from its checkpoint/ (loads its config.json; same run dir)")
     run_group.add_argument("--notes", type=str, default="", help="Free-text description of the run, saved in config.json")
 
     hparam_group = parser.add_argument_group("config (defaults = UPPERCASE constants in audiollm/config.py)")
@@ -227,7 +231,7 @@ def build_arg_parser():
 
 def parse_args(argv=None):
     """
-    Resolve the config with precedence: explicit CLI flags > --config file (or the --eval_only run's config.json)
+    Resolve the config with precedence: explicit CLI flags > --config file (or the --eval_only / --resume run's config.json)
     > constants at the top of this file.
 
     Returns:
@@ -235,7 +239,8 @@ def parse_args(argv=None):
     """
     parser = build_arg_parser()
     pre_args, _ = parser.parse_known_args(argv)
-    base_config_path = pre_args.config or (Path(pre_args.eval_only, "config.json") if pre_args.eval_only else None)
+    run_dir = pre_args.eval_only or pre_args.resume
+    base_config_path = pre_args.config or (Path(run_dir, "config.json") if run_dir else None)
     if base_config_path:
         base_config = with_legacy_defaults(json.load(open(base_config_path)))
         unknown_keys = [key for key in base_config if key.isupper() and key not in DEFAULT_CONFIG]
