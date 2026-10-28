@@ -89,7 +89,7 @@ def train(args, run_dir, tracker, log_and_print):
 
     total_train_hours = sum(item["sec"] for item in train_items) / 3600.0
     log_and_print(f"train utts {len(train_items)} ({total_train_hours:.1f} h), val utts " +
-                  ", ".join(f"{name} {len(items)}" for name, items in validation_sets.items()))
+                  ", ".join(f"{runs_lib.split_label(name)} {len(items)}" for name, items in validation_sets.items()))
     batch_text = f"tokens {C.BATCH_TOKENS}" if C.BATCH_TOKENS else f"{C.BATCH_SIZE}"
     log_and_print(
         f"batch {batch_text} x accum {C.GRAD_ACCUM} | {C.OPTIMIZER} lr {C.LR:.1e} {C.LR_SCHEDULE} warmup {C.WARMUP_STEPS} "
@@ -277,7 +277,7 @@ def train(args, run_dir, tracker, log_and_print):
                         validation_items,
                         featurizer,
                         model,
-                        progress_desc=f"val {val_name} @{optimizer_step}",
+                        progress_desc=f"val {runs_lib.split_label(val_name)} @{optimizer_step}",
                         output_hypotheses_path=val_hypotheses_path(run_dir, val_name, optimizer_step),
                     )
                     val_wers[val_name] = round(val_metrics["wer"] * 100, 2)
@@ -291,11 +291,11 @@ def train(args, run_dir, tracker, log_and_print):
                     for ablation in val_ablations:
                         ablation_wers[f"wer_{ablation}"] = evaluate_dataset(
                             validation_items, featurizer, model,
-                            progress_desc=f"val {val_name} {ablation} @{optimizer_step}", audio_ablation=ablation,
+                            progress_desc=f"val {runs_lib.split_label(val_name)} {ablation} @{optimizer_step}", audio_ablation=ablation,
                         )["wer"]
                     ablation_text = "".join(f" | {key} {val * 100:.2f}" for key, val in ablation_wers.items())
                     log_and_print(
-                        f"[val] step {optimizer_step} {val_name}[:{len(validation_items)}] "
+                        f"[val] step {optimizer_step} {runs_lib.split_label(val_name)}[:{len(validation_items)}] "
                         f"{format_eval_metrics(val_metrics)}{best_text}{ablation_text}"
                     )
                     for example in val_metrics["examples"]:

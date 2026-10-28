@@ -117,9 +117,19 @@ def refresh_run_views(run_dir, log=None):
         (log or print)(f"warning: could not refresh plots/index for {run_dir}: {error!r}")
 
 
-def short_split_name(name):
-    """Legend label for a dev split: "ami_ihm/validation" -> "ami_ihm", "dev-clean" -> "dev-clean"."""
-    return name.split("/")[0]
+LIBRISPEECH_SPLIT = re.compile(r"^(dev|test|train)-(clean|other)(-\d+)?$")
+
+
+def split_label(name):
+    """
+    Explicit name for a split spec, "<split>_<dataset>": "dev-clean" -> "dev-clean_librispeech",
+    "ami_ihm/validation" -> "validation_ami_ihm", "fleurs_en/validation" -> "validation_fleurs_en". Used for plot
+    legends, log lines and the val_hyps/<label>/ and hyp_<label>.jsonl file names; anything else is returned as is.
+    """
+    if LIBRISPEECH_SPLIT.match(name):
+        return f"{name}_librispeech"
+    corpus, slash, split = name.partition("/")
+    return f"{split}_{corpus}" if slash and "+" not in name else name
 
 
 def plot_run(run_dir):
@@ -202,7 +212,7 @@ def plot_run(run_dir):
         for name, split_rows in by_split.items():
             values = col(split_rows, key)
             if any(v is not None for v in values):
-                ax.plot(col(split_rows, "step"), pct(values), marker, color=colors[name], label=short_split_name(name))
+                ax.plot(col(split_rows, "step"), pct(values), marker, color=colors[name], label=split_label(name))
                 drawn = True
         if drawn and best_step is not None:
             ax.axvline(best_step, color="gray", ls=":", lw=1)
@@ -214,7 +224,7 @@ def plot_run(run_dir):
     if val:
         best_split = next(iter(by_split))
         plot_val_metric(ax_val, "wer", f"val WER % (best {fmt(summary.get('best_val_wer'))} on "
-                                       f"{short_split_name(best_split)} @ {best_step})")
+                                       f"{split_label(best_split)} @ {best_step})")
         if not plot_val_metric(ax_exact, "exact", "val exact-match % (utts with WER 0)"):
             ax_exact.text(0.5, 0.5, "not logged (runs before 2026-10-28)", ha="center", va="center", transform=ax_exact.transAxes)
             ax_exact.axis("off")
@@ -228,7 +238,7 @@ def plot_run(run_dir):
                 values = col(split_rows, key)
                 if any(v is not None for v in values):
                     ax_ablate.plot(col(split_rows, "step"), pct(values), marker, color=colors[name],
-                                   label=f"{short_split_name(name)} {key[4:]}")
+                                   label=f"{split_label(name)} {key[4:]}")
                     drawn = True
             if drawn:
                 ax_ablate.plot(col(split_rows, "step"), pct(col(split_rows, "wer")), "-", color=colors[name], alpha=0.35)
@@ -239,7 +249,7 @@ def plot_run(run_dir):
             ax_ablate.text(0.5, 0.5, "EVAL_AUDIO_ABLATIONS off", ha="center", va="center", transform=ax_ablate.transAxes)
             ax_ablate.axis("off")
 
-    final = {**{f"test {k}": v for k, v in summary.get("test_wer", {}).items()},
+    final = {**{f"test {split_label(k)}": v for k, v in summary.get("test_wer", {}).items()},
              **summary.get("benchmark", {}), **summary.get("benchmark_extra", {})}
     if final:
         names = list(final)[::-1]
@@ -408,7 +418,7 @@ def cmd_curve(args):
     if val_rows:
         print()
         print_table(["step", "split", "val WER", "sub", "del", "ins"],
-                    [[r["step"], short_split_name(r.get("split", run["config"].get("VAL_SPLIT", "val"))),
+                    [[r["step"], split_label(r.get("split", run["config"].get("VAL_SPLIT", "val"))),
                       *(f"{r[k] * 100:.2f}" for k in ("wer", "sub", "del", "ins"))] for r in val_rows])
 
 
@@ -424,7 +434,7 @@ def cmd_best(args):
     rows = []
     for model, (run, n_candidates) in best_runs_by_model().items():
         summary = run["summary"]
-        test = ", ".join(f"{short_split_name(k)} {v:.2f}" for k, v in summary.get("test_wer", {}).items())
+        test = ", ".join(f"{split_label(k)} {v:.2f}" for k, v in summary.get("test_wer", {}).items())
         rows.append([model.split("/")[-1], run["id"], f"{summary['best_val_wer']:.2f}", test or "-", str(n_candidates)])
     print_table(["model", "best run", "best val", "test", "candidates"], rows)
 

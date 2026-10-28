@@ -306,3 +306,11 @@ Earlier months: `docs/worklog_archive/YYYY-MM.md`.
   - C `mix544h_conv_stack8_cont2_19k`: the same, but on the 544 h mix. This control separates +500 h from +steps.
   - Both add dev-other as the 4th val split (train-other-500 should mostly help test-other).
 - Output-LayerNorm idea deferred: no run has shown the audio/text norm gap hurts.
+
+## 2026-10-28 - Val/test splits named with their dataset (`runs.split_label`)
+- "dev-clean" did not say it is LibriSpeech, and corpus val folders dropped the split ("ami_ihm"). Now every legend,
+  log line, `runs.py curve/best` row and file name uses `<split>_<dataset>`: `dev-clean_librispeech`,
+  `validation_ami_ihm`, `validation_fleurs_en`, `hyp_test-clean_librispeech.jsonl`. `metrics.jsonl` keeps the raw split spec.
+- Plots already drew one line per dev split. ls100h_* runs show a single line only because their VAL_SPLIT is just
+  dev-clean (inherited from the mix544h config).
+- Existing run dirs renamed (val_hyps/*, hyp_*.jsonl) and all plots redrawn. The SpecAugment run is renamed when it exits.

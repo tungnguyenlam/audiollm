@@ -20,8 +20,9 @@ Each training run gets its own directory runs/<YYYYmmdd-HHMMSS>_<run_name>/ with
     metrics.jsonl    time series: one JSON row per train log window / val pass / test split
     summary.json     status (running/done/failed/interrupted), best val WER, test WER, parameter counts, duration
     model_summary.txt  LLM shape, parameter counts per component, projector layers
-    log.txt, lora/, proj.pt, hyp_<test split>.jsonl (full test hyps), test_results.json
-    val_hyps/<dev split>/step_<N>.jsonl   {id, ref, hyp} of every val utt at each val pass
+    log.txt, lora/, proj.pt, hyp_<test split label>.jsonl (full test hyps), test_results.json
+    val_hyps/<dev split label>/step_<N>.jsonl   {id, ref, hyp} of every val utt at each val pass
+Split labels name the dataset (runs.split_label): dev-clean_librispeech, validation_ami_ihm, validation_fleurs_en.
 runs/latest -> the newest run, runs/latest_model -> the newest run with saved weights.
 Compare runs with `python runs.py` (see runs.py --help).
 

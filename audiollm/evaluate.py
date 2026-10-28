@@ -10,6 +10,7 @@ from pathlib import Path
 import jiwer
 from tqdm import tqdm
 
+import runs as runs_lib
 from audiollm import config as C
 from audiollm.data import SpeechDataset, create_dataloader, load_split
 from audiollm.utils import compute_context, make_progress_bar
@@ -25,8 +26,11 @@ def normalize_text_for_wer(text):
 
 
 def val_hypotheses_path(run_dir, split_name, step):
-    """runs/<id>/val_hyps/<split>/step_001000.jsonl: every val utt's {id, ref, hyp} for one val pass on one dev split."""
-    split_dir = Path(run_dir, "val_hyps", re.sub(r"[^\w.-]+", "_", split_name.split("/")[0]))
+    """
+    runs/<id>/val_hyps/<split label>/step_001000.jsonl (e.g. val_hyps/dev-clean_librispeech/, runs.split_label):
+    every val utt's {id, ref, hyp} for one val pass on one dev split.
+    """
+    split_dir = Path(run_dir, "val_hyps", re.sub(r"[^\w.-]+", "_", runs_lib.split_label(split_name)))
     split_dir.mkdir(parents=True, exist_ok=True)
     return split_dir / f"step_{step:06d}.jsonl"
 
@@ -127,16 +131,16 @@ def run_test_evaluation(run_dir, featurizer, model, log_fn=None):
     log_fn = log_fn or (lambda message: tqdm.write(message, file=sys.stdout))
     test_results = {}
     for split_name in C.TEST_SPLITS:
-        hypotheses_filepath = os.path.join(run_dir, f"hyp_{split_name.replace('/', '-')}.jsonl")
+        hypotheses_filepath = os.path.join(run_dir, f"hyp_{runs_lib.split_label(split_name)}.jsonl")
         test_results[split_name] = evaluate_dataset(
             load_split(split_name),
             featurizer,
             model,
             output_hypotheses_path=hypotheses_filepath,
-            progress_desc=f"test {split_name}",
+            progress_desc=f"test {runs_lib.split_label(split_name)}",
         )
         test_results[split_name].pop("examples")
-        log_fn(f"[test] {split_name} {format_eval_metrics(test_results[split_name])}")
+        log_fn(f"[test] {runs_lib.split_label(split_name)} {format_eval_metrics(test_results[split_name])}")
 
     json.dump(test_results, open(os.path.join(run_dir, "test_results.json"), "w"), indent=2)
     return test_results
