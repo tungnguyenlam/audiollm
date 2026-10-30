@@ -1,24 +1,25 @@
 """
-English ASR benchmark on the Open ASR Leaderboard test sets (the suite used in Table II of arXiv 2606.10231).
+ASR benchmark on the Open ASR Leaderboard English test sets (Table II of arXiv 2606.10231) and local Vietnamese test sets.
 
-Data comes from hf-audio/esb-datasets-test-only-sorted (parquet, 16 kHz audio bytes). Text on both sides goes
-through the Whisper EnglishTextNormalizer, which the leaderboard also uses, so numbers are directly comparable to the
-leaderboard and to the paper. That's different from the `[a-z' ]` normalisation in train.py, so expect small
-differences on LibriSpeech.
+English data comes from hf-audio/esb-datasets-test-only-sorted (parquet, 16 kHz audio bytes) + local fleurs_en / edacc,
+scored with Whisper EnglishTextNormalizer so numbers are directly comparable to the Open ASR Leaderboard and the paper.
+Vietnamese data (`--sets vi`, or individual VI_SETS names) comes from local parquet shards in data/corpora/, scored with
+the 5-step Vietnamese spoken-form normaliser in audiollm/vietnamese.py (docs/DATASETS_VI.md Section 6).
 
-    python benchmark.py mel:runs/baseline_fixed12.5hz                      # our checkpoint, all 7 sets
+    python benchmark.py mel:runs/baseline_fixed12.5hz                      # our checkpoint, all 9 English sets
     python benchmark.py mel:runs/latest --sets earnings22 ami              # newest run, some sets
-    python benchmark.py hf:openai/whisper-large-v3-turbo --sets librispeech_clean --limit 100
-    python benchmark.py --table                 # paper rows + hf baselines + the best run per base LLM, with its config
-    python benchmark.py --table --all_runs      # ... plus every other benchmarked mel: run
+    python benchmark.py mel:runs/latest --sets vi                          # all downloaded Vietnamese test sets
+    python benchmark.py hf:vinai/PhoWhisper-small --sets vi --limit 100    # HF baseline on Vietnamese
+    python benchmark.py --table                 # English table: paper rows + hf baselines + best run per base LLM
+    python benchmark.py --table --sets vi       # Vietnamese table across VI_SETS
 
 "Best run per base LLM": among finished, non-smoke runs in runs/ with the same MODEL (230M, 350M, 1.2B, ...), the one
-with the lowest in-training val WER (dev-clean subset). Selection never looks at test sets. If that run has no
-benchmark results yet, the table shows train.py's own LibriSpeech test WER (marked †) and the command to benchmark it.
+with the lowest in-training val WER. Selection never looks at test sets. If that run has no benchmark results yet, the
+table shows train.py's own LibriSpeech test WER (marked †) and the command to benchmark it.
 
 Outputs go to results/<tag>/: <set>.jsonl (id, ref, hyp, normalised ref/hyp) and summary.json (WER %, RTFx).
 For mel: runs the per-set WERs are also stored in runs/<id>/summary.json ("benchmark"), shown in runs/INDEX.md and
-plots.png. train.py runs this automatically after training (BENCHMARK_SETS, default "all").
+plots.png. train.py runs this automatically after training (BENCHMARK_SETS, default "all" = English suite; "vi" = Vietnamese suite).
 """
 import argparse
 import io
@@ -49,13 +50,28 @@ SETS = {
     "spgispeech": ("spgispeech", "test"),                # 11.6 GB
 }
 OPENASR_SETS = list(SETS)  # current leaderboard English short-form suite minus Common Voice (TED-LIUM was dropped)
-# Extra test sets already on disk from download_corpora.py: set name -> (parquet glob, reference text column).
+# Extra English test sets already on disk from download_corpora.py: set name -> (parquet glob, reference text column).
 # Reported next to the leaderboard sets but kept out of its mean (and stored as "benchmark_extra" in a run's summary).
 LOCAL_SETS = {
     "fleurs_en": ("data/corpora/fleurs_en/parquet-data/en_us/test-*.parquet", "raw_transcription"),  # read Wikipedia
     "edacc": ("data/corpora/edacc/data/test-*.parquet", "text"),  # accented conversational English, never trained on
 }
 ALL_SETS = OPENASR_SETS + list(LOCAL_SETS)
+
+# Vietnamese ASR test sets on disk from `download_corpora.py --vi_stage1` (docs/DATASETS_VI.md Section 3).
+# Pattern may be a tuple of fallback globs (first matching glob wins, so phoaudiobook never double-counts).
+VI_SETS = {
+    "gigaspeech2_vi": ("data/corpora/gigaspeech2_vi/data/test-*.parquet", "transcription"),  # main vi benchmark (11.2 h)
+    "fleurs_vi": ("data/corpora/fleurs_vi/parquet-data/vi_vn/test-*.parquet", "raw_transcription"),  # read Wikipedia (857 utts)
+    "vimd": ("data/corpora/vimd/data/test-*.parquet", "text"),                               # 63-province dialects (11.2 h)
+    "lsvsc": ("data/corpora/lsvsc/data/test-*.parquet", "transcription"),                    # multi-domain northern/central/southern
+    "phoaudiobook": (
+        ("data/corpora/phoaudiobook/data/test-*.parquet", "data/corpora/phoaudiobook_200h/data/test-*.parquet"),
+        "text",
+    ),
+}
+ALL_LOCAL_SETS = {**LOCAL_SETS, **VI_SETS}
+KNOWN_SETS = ALL_SETS + list(VI_SETS)
 DECODE_KEYS = ("MAX_NEW_TOKENS", "MAX_TOKENS_PER_SEC", "NO_REPEAT_NGRAM_SIZE")  # audiollm/config.py keys used by mel: decoding
 
 # Table II of arXiv 2606.10231 (WER %). Their Avg also includes TED-LIUM, so only compare per-set columns.
@@ -70,11 +86,27 @@ PAPER = {
                                           librispeech_other=5.50, spgispeech=2.47, voxpopuli=8.25),
 }
 
+# Published Vietnamese WER (%) references from docs/DATASETS_VI.md Section 4 (normalisation differs across papers).
+PAPER_VI = {
+    "[ref] Whisper-large-v3": dict(gigaspeech2_vi=17.94, fleurs_vi=8.59),
+    "[ref] Zipformer-152M (GS2)": dict(gigaspeech2_vi=12.83, fleurs_vi=11.59),
+    "[ref] VietASR-68M": dict(gigaspeech2_vi=7.68, fleurs_vi=10.96),
+    "[ref] Qwen3-ASR-0.6B": dict(fleurs_vi=8.52),
+    "[ref] Qwen3-ASR-1.7B": dict(gigaspeech2_vi=8.24, fleurs_vi=5.55),
+}
+
 
 # ---------------------------------------------------------------- data
+def local_shards(name):
+    """Matching parquet shard paths for a LOCAL_SETS or VI_SETS entry (empty list if not downloaded yet)."""
+    pattern, _ = ALL_LOCAL_SETS[name]
+    patterns = (pattern,) if isinstance(pattern, str) else pattern
+    return next((shards for p in patterns if (shards := sorted(Path().glob(p)))), [])
+
+
 def load_set(name, limit=None):
     """Return list of dicts {id, bytes, text, sec}. The ESB parquets are sorted by duration, longest first."""
-    if name in LOCAL_SETS:
+    if name in ALL_LOCAL_SETS:
         return load_local_set(name, limit)
     config, prefix = SETS[name]
     files = sorted(f for f in list_repo_files(ESB_REPO, repo_type="dataset")
@@ -90,9 +122,9 @@ def load_set(name, limit=None):
 
 
 def load_local_set(name, limit=None):
-    """LOCAL_SETS test split as {id, bytes, text, sec}, sorted longest first like the ESB sets."""
-    pattern, text_column = LOCAL_SETS[name]
-    shards = sorted(Path().glob(pattern))
+    """LOCAL_SETS / VI_SETS test split as {id, bytes, text, sec}, sorted longest first like the ESB sets."""
+    pattern, text_column = ALL_LOCAL_SETS[name]
+    shards = local_shards(name)
     if not shards:
         raise SystemExit(f"no parquet files for {name} ({pattern}); run download_corpora.py first")
     items = []
@@ -151,17 +183,17 @@ class MelLLM:
 
 
 class HFPipeline:
-    """Any transformers ASR checkpoint (Whisper, wav2vec2, Moonshine, ...) via the ASR pipeline."""
+    """Any transformers ASR checkpoint (Whisper, PhoWhisper, wav2vec2, Moonshine, ...) via the ASR pipeline."""
 
     run_dir = None
 
-    def __init__(self, model_id, batch_size):
+    def __init__(self, model_id, batch_size, lang="en"):
         from transformers import pipeline
-        whisper = "whisper" in model_id
+        whisper = "whisper" in model_id.lower()
         # Whisper's encoder takes at most 30 s; a few LibriSpeech/ESB clips are longer, so chunk those
         self.pipe = pipeline("automatic-speech-recognition", model=model_id, dtype=torch.bfloat16, device="cuda",
                              chunk_length_s=30 if whisper else None)
-        self.kwargs = {"generate_kwargs": {"language": "en", "task": "transcribe"}} if whisper else {}
+        self.kwargs = {"generate_kwargs": {"language": lang, "task": "transcribe"}} if whisper else {}
         self.batch_size = batch_size or 16
 
     def transcribe(self, batch):
@@ -169,13 +201,13 @@ class HFPipeline:
         return [o["text"] for o in self.pipe(audio, batch_size=len(audio), **self.kwargs)]
 
 
-def load_model(spec, batch_size):
+def load_model(spec, batch_size, lang="en"):
     kind, _, name = spec.partition(":")
     if kind == "mel":
         run_dir = Path(os.path.relpath(Path(name).resolve()))  # runs/latest -> runs/<id>, so results stay put
         return MelLLM(run_dir, batch_size), "mel_" + run_dir.name
     if kind == "hf":
-        return HFPipeline(name, batch_size), "hf_" + name.replace("/", "__")
+        return HFPipeline(name, batch_size, lang=lang), "hf_" + name.replace("/", "__")
     raise SystemExit(f"model spec must be mel:<run_dir> or hf:<model_id>, got {spec}")
 
 
@@ -188,7 +220,8 @@ def run(model, items, normalizer, out_path):
             batch = items[i:i + model.batch_size]
             for it, hyp in zip(batch, model.transcribe(batch)):
                 ref_n, hyp_n = normalizer(it["text"]), normalizer(hyp)
-                f.write(json.dumps({"id": it["id"], "ref": it["text"], "hyp": hyp, "ref_n": ref_n, "hyp_n": hyp_n}) + "\n")
+                f.write(json.dumps({"id": it["id"], "ref": it["text"], "hyp": hyp, "ref_n": ref_n, "hyp_n": hyp_n},
+                                   ensure_ascii=False) + "\n")
                 if ref_n.strip():  # leaderboard drops references that normalise to empty
                     refs.append(ref_n)
                     hyps.append(hyp_n)
@@ -202,13 +235,23 @@ def run(model, items, normalizer, out_path):
 
 
 def resolve_sets(sets):
-    """"all" -> every set; also accepts a comma-separated string (train.py's BENCHMARK_SETS)."""
+    """"all" -> English suite (Open ASR 7 + local English sets); "openasr" -> Open ASR 7; "vi" -> downloaded VI_SETS."""
     if isinstance(sets, str):
-        sets = [s for s in sets.split(",") if s]
-    sets = ALL_SETS if sets == ["all"] else OPENASR_SETS if sets == ["openasr"] else list(sets)
-    unknown = [s for s in sets if s not in ALL_SETS]
+        sets = [s.strip() for s in sets.split(",") if s.strip()]
+    if sets == ["all"]:
+        return list(ALL_SETS)
+    if sets == ["openasr"]:
+        return list(OPENASR_SETS)
+    if sets == ["vi"]:
+        available = [name for name in VI_SETS if local_shards(name)]
+        if not available:
+            raise SystemExit(f"no Vietnamese benchmark parquets found on disk ({list(VI_SETS)}); "
+                             "run `python download_corpora.py --vi_stage1` first")
+        return available
+    sets = list(sets)
+    unknown = [s for s in sets if s not in KNOWN_SETS]
     if unknown:
-        raise SystemExit(f"unknown benchmark sets {unknown}; choose from {ALL_SETS}, 'openasr' or 'all'")
+        raise SystemExit(f"unknown benchmark sets {unknown}; choose from {KNOWN_SETS}, 'openasr', 'vi' or 'all'")
     return sets
 
 
@@ -235,23 +278,37 @@ def benchmark(model, tag, sets, limit=None, log=print, spec=None, track=True):
     summary["_model"] = f"mel:{model.run_dir}" if model.run_dir else spec  # mel: always the resolved run dir
     if model.run_dir:
         summary["_decode"] = {key: getattr(model.t, key) for key in DECODE_KEYS}
-    normalizer = WhisperTokenizer.from_pretrained("openai/whisper-large-v3").normalize
+    en_normalizer = (WhisperTokenizer.from_pretrained("openai/whisper-large-v3").normalize
+                     if any(s in ALL_SETS for s in sets) else None)
+    if any(s in VI_SETS for s in sets):
+        from audiollm.vietnamese import normalize_vi_text as vi_normalizer
+    else:
+        vi_normalizer = None
     track_run = model.run_dir is not None and not limit and track
     for name in sets:
         if track_run:
             update_run_summary(model.run_dir, benchmark_status=f"running {name}")
         items = load_set(name, limit)
+        normalizer = vi_normalizer if name in VI_SETS else en_normalizer
         summary[name] = run(model, items, normalizer, out_dir / f"{name}.jsonl")
         log(f"[benchmark] {name} {summary[name]}")
         json.dump(summary, open(summary_path, "w"), indent=2)
         if track_run:
-            update_run_summary(model.run_dir, benchmark={s: summary[s]["wer"] for s in OPENASR_SETS if s in summary},
-                               benchmark_extra={s: summary[s]["wer"] for s in LOCAL_SETS if s in summary},
-                               benchmark_results=str(out_dir))
+            bench_en = {s: summary[s]["wer"] for s in OPENASR_SETS if s in summary}
+            bench_vi = {s: summary[s]["wer"] for s in VI_SETS if s in summary}
+            bench_extra = {s: summary[s]["wer"] for s in LOCAL_SETS if s in summary}
+            # Vietnamese-only runs store VI_SETS as primary "benchmark" so runs.py / INDEX.md display them cleanly
+            primary = bench_en if bench_en else bench_vi
+            extra = {**bench_extra, **(bench_vi if bench_en else {})}
+            update_run_summary(model.run_dir, benchmark=primary, benchmark_extra=extra, benchmark_results=str(out_dir))
 
     done = [summary[s]["wer"] for s in OPENASR_SETS if s in summary]
     if len(done) == len(OPENASR_SETS):
         summary["mean_wer"] = round(sum(done) / len(done), 2)
+        json.dump(summary, open(summary_path, "w"), indent=2)
+    done_vi = [summary[s]["wer"] for s in VI_SETS if s in summary]
+    if done_vi and all(s in VI_SETS for s in sets):
+        summary["vi_mean_wer"] = round(sum(done_vi) / len(done_vi), 2)
         json.dump(summary, open(summary_path, "w"), indent=2)
     if track_run:
         update_run_summary(model.run_dir, benchmark_status="done")
@@ -263,7 +320,7 @@ def load_results():
     return {p.parent.name: json.load(open(p)) for p in sorted(Path(RESULTS).glob("*/summary.json"))}
 
 
-def result_for_run(results, run_dir):
+def result_for_run(results, run_dir, suite_sets=ALL_SETS):
     """The benchmark result of a run dir: prefer full (non --limit) results, then the one covering most sets."""
     matches = [
         (tag, summary) for tag, summary in results.items()
@@ -272,29 +329,42 @@ def result_for_run(results, run_dir):
     ]
     if not matches:
         return None, None
-    return max(matches, key=lambda m: ("_limit" not in m[0], sum(s in m[1] for s in ALL_SETS), m[0]))
+    return max(matches, key=lambda m: ("_limit" not in m[0], sum(s in m[1] for s in suite_sets), m[0]))
 
 
-def print_table(all_runs=False):
+def print_table(all_runs=False, vi=False):
     """
     Markdown table: paper rows, hf: baselines, and the best run per base LLM (lowest in-training val WER, see
     runs.best_runs_by_model). --all_runs adds every other mel: result too. Then the config of each best run.
     """
     import runs as runs_lib
 
+    suite_sets = list(VI_SETS) if vi else ALL_SETS
+    avg_suite = list(VI_SETS) if vi else OPENASR_SETS
+    avg_header = "VI avg (cols present)" if vi else "OpenASR avg (cols present)"
     results = load_results()
-    best = runs_lib.best_runs_by_model()
-    rows = dict(PAPER)
+    all_finished = [r for r in runs_lib.all_runs()
+                    if r["summary"].get("status") == "done" and not r["meta"].get("max_steps")
+                    and r["summary"].get("best_val_wer") is not None
+                    and ((r["config"].get("LANG", "en") == "vi") if vi else (r["config"].get("LANG", "en") != "vi"))]
+    by_model = {}
+    for r in all_finished:
+        by_model.setdefault(r["config"].get("MODEL", "?"), []).append(r)
+    best = {m: (min(rs, key=lambda x: x["summary"]["best_val_wer"]), len(rs)) for m, rs in sorted(by_model.items())}
+
+    rows = dict(PAPER_VI if vi else PAPER)
     for tag, summary in results.items():
         if not summary.get("_model", "").startswith("mel:"):
-            rows[tag] = {k: v["wer"] for k, v in summary.items() if k in ALL_SETS}
+            row = {k: v["wer"] for k, v in summary.items() if k in suite_sets}
+            if row:
+                rows[tag] = row
 
     best_result_tags = set()
-    train_eval_fallback = {"librispeech_clean": "test-clean", "librispeech_other": "test-other"}
+    train_eval_fallback = {} if vi else {"librispeech_clean": "test-clean", "librispeech_other": "test-other"}
     for model, (run, _) in best.items():
-        tag, summary = result_for_run(results, run["dir"])
+        tag, summary = result_for_run(results, run["dir"], suite_sets=suite_sets)
         best_result_tags.add(tag)
-        row = {k: v["wer"] for k, v in summary.items() if k in ALL_SETS} if summary else {}
+        row = {k: v["wer"] for k, v in summary.items() if k in suite_sets} if summary else {}
         for bench_set, split in train_eval_fallback.items():  # not benchmarked: show train.py's own test eval (†)
             if bench_set not in row and split in run["summary"].get("test_wer", {}):
                 row[bench_set] = f"{run['summary']['test_wer'][split]:.2f}†"
@@ -302,11 +372,13 @@ def print_table(all_runs=False):
     if all_runs:
         for tag, summary in results.items():
             if summary.get("_model", "").startswith("mel:") and tag not in best_result_tags:
-                rows[tag] = {k: v["wer"] for k, v in summary.items() if k in ALL_SETS}
+                row = {k: v["wer"] for k, v in summary.items() if k in suite_sets}
+                if row:
+                    rows[tag] = row
 
-    cols = [s for s in ALL_SETS if any(s in r for r in rows.values())]
-    avg_cols = [c for c in cols if c in OPENASR_SETS]  # local extra sets are shown but not averaged
-    print("| model | " + " | ".join(cols) + " | OpenASR avg (cols present) |")
+    cols = [s for s in suite_sets if any(s in r for r in rows.values())]
+    avg_cols = [c for c in cols if c in avg_suite]
+    print("| model | " + " | ".join(cols) + f" | {avg_header} |")
     print("|---" * (len(cols) + 2) + "|")
     for name, r in rows.items():
         vals = [r.get(c) for c in cols]
@@ -319,13 +391,13 @@ def print_table(all_runs=False):
               "not the Whisper normaliser)")
 
     if not best:
-        print(f"\nno finished training runs in {runs_lib.RUNS_DIR}/ yet")
+        print(f"\nno finished {'Vietnamese ' if vi else ''}training runs in {runs_lib.RUNS_DIR}/ yet")
         return
     from audiollm import config as C  # only for the defaults, to mark which config values a run changed
     print("\n## Best run per base LLM (selected by in-training val WER; test sets are never used for selection)")
     for model, (run, n_candidates) in best.items():
         summary, meta = run["summary"], run["meta"]
-        tag, _ = result_for_run(results, run["dir"])
+        tag, _ = result_for_run(results, run["dir"], suite_sets=suite_sets)
         cfg = run["config"]
         print(f"\n### {model}: {run['dir']}")
         print(f"- selected: val WER {summary['best_val_wer']:.2f} on {cfg.get('VAL_SPLIT', '?')}[:{cfg.get('VAL_N', '?')}] "
@@ -333,7 +405,8 @@ def print_table(all_runs=False):
               f"best of {n_candidates} finished run(s) for this LLM")
         if summary.get("test_wer"):
             print("- train.py test eval: " + ", ".join(f"{k} {v:.2f}" for k, v in summary["test_wer"].items()))
-        print(f"- benchmark: results/{tag}/" if tag else f"- benchmark: not run yet -> python benchmark.py mel:{run['dir']}")
+        sets_flag = " --sets vi" if vi else ""
+        print(f"- benchmark: results/{tag}/" if tag else f"- benchmark: not run yet -> python benchmark.py mel:{run['dir']}{sets_flag}")
         if meta.get("command"):
             print(f"- command: `{meta['command']}`")
         if meta.get("notes") or summary.get("notes"):
@@ -360,7 +433,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model", nargs="?", help="mel:<run_dir> or hf:<model_id>")
     ap.add_argument("--sets", nargs="+", default=["all"],
-                    help=f"subset of {ALL_SETS}, 'openasr' (leaderboard 7) or 'all' (leaderboard + local test sets)")
+                    help=f"subset of {KNOWN_SETS}, 'openasr' (leaderboard 7), 'vi' (Vietnamese local sets) or 'all' (English suite)")
+    ap.add_argument("--lang", choices=("en", "vi"), default=None,
+                    help="Whisper decode language for hf: models (default: inferred from --sets)")
     ap.add_argument("--limit", type=int, default=None, help="evaluate N evenly spaced utterances per set (smoke test)")
     ap.add_argument("--batch_size", type=int, default=None)
     ap.add_argument("--tag", default=None, help="results/<tag> (default derived from model)")
@@ -373,26 +448,29 @@ def main():
     decode.add_argument("--no_repeat_ngram_size", type=int, default=None, help="0 = off")
     args = ap.parse_args()
 
+    is_vi_table = args.sets == ["vi"] or all(s in VI_SETS for s in args.sets)
     if args.table:
-        return print_table(args.all_runs)
+        return print_table(args.all_runs, vi=is_vi_table)
     if not args.model:
         ap.error("model is required unless --table")
     sets = resolve_sets(args.sets)
+    lang = args.lang or ("vi" if all(s in VI_SETS for s in sets) else "en")
 
-    model, tag = load_model(args.model, args.batch_size)
+    model, tag = load_model(args.model, args.batch_size, lang=lang)
     overrides = {key: getattr(args, key.lower()) for key in DECODE_KEYS if getattr(args, key.lower()) is not None}
     if overrides and not model.run_dir:
         ap.error("decoding overrides only apply to mel: models")
     for key, val in overrides.items():
         setattr(model.t, key, val)
     decode_suffix = "".join(f"_{key.lower()}{val:g}" for key, val in overrides.items())
-    tag = args.tag or tag + decode_suffix + (f"_limit{args.limit}" if args.limit else "")
+    suite_suffix = "_vi" if (all(s in VI_SETS for s in sets) and not args.model.startswith("mel:")) else ""
+    tag = args.tag or tag + suite_suffix + decode_suffix + (f"_limit{args.limit}" if args.limit else "")
     benchmark(model, tag, sets, args.limit, log=lambda msg: print(msg, flush=True), spec=args.model,
               track=not overrides)
     if model.run_dir and not args.limit and not overrides:
         import runs as runs_lib
         runs_lib.refresh_run_views(model.run_dir)
-    print_table()
+    print_table(vi=all(s in VI_SETS for s in sets))
 
 
 if __name__ == "__main__":

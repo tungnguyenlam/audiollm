@@ -1,6 +1,6 @@
 """
 SpeechLLM = backbone (LLM + LoRA + tokenizer) + audio projector, laid out as
-[BOS][audio tokens][PROMPT][text][EOS], with the loss on [text][EOS] only.
+[BOS][audio tokens][PROMPT][text][EOS] (or without [BOS] on BOS-less tokenizers like Qwen3), with the loss on [text][EOS] only.
 """
 import math
 import os
@@ -29,6 +29,7 @@ class SpeechLLM(nn.Module):
         self.llm = llm
         self.projector = projector
         self.prompt_token_ids = tokenizer(C.PROMPT, add_special_tokens=False).input_ids
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     @classmethod
     def load(cls, saved_run_dir=None, trainable=False):
@@ -53,7 +54,7 @@ class SpeechLLM(nn.Module):
 
     def build_inputs(self, batch, is_train, audio_ablation="none"):
         """
-        Project a collated batch's features and lay out each utterance as [BOS][audio][prompt][target if is_train],
+        Project a collated batch's features and lay out each utterance as [BOS?][audio][prompt][target if is_train],
         padded with the pad-token embedding: right-padded for training, left-padded for batched generation.
 
         audio_ablation: "none" | "shuffle" (each utterance gets its batch neighbour's audio) | "zeros" (all-zero
@@ -74,18 +75,20 @@ class SpeechLLM(nn.Module):
         projected = self.projector(features.to(C.DEVICE, proj_dtype), feature_lengths.to(C.DEVICE))
 
         embed_tokens = self.llm.get_input_embeddings()
-        bos_token_embed = embed_tokens(torch.tensor([self.tokenizer.bos_token_id], device=C.DEVICE))
+        has_bos = self.tokenizer.bos_token_id is not None
+        bos_prefix = [embed_tokens(torch.tensor([self.tokenizer.bos_token_id], device=C.DEVICE))] if has_bos else []
+        n_bos = int(has_bos)
         sequences, labels = [], []
         for row, target in enumerate(batch["target"]):
             audio_embeds = projected.embeds[row, :int(projected.lengths[row])].to(C.DTYPE)
             text_token_ids = self.prompt_token_ids + (target if is_train else [])
             text_embeds = embed_tokens(torch.tensor(text_token_ids, device=C.DEVICE))
-            sequences.append(torch.cat([bos_token_embed, audio_embeds, text_embeds], dim=0))
+            sequences.append(torch.cat([*bos_prefix, audio_embeds, text_embeds], dim=0))
             if is_train:
-                labels.append([-100] * (1 + audio_embeds.shape[0] + len(self.prompt_token_ids)) + target)
+                labels.append([-100] * (n_bos + audio_embeds.shape[0] + len(self.prompt_token_ids)) + target)
 
         max_len, hidden = max(seq.shape[0] for seq in sequences), sequences[0].shape[1]
-        pad_token_embed = embed_tokens(torch.tensor([self.tokenizer.pad_token_id], device=C.DEVICE))
+        pad_token_embed = embed_tokens(torch.tensor([self.pad_token_id], device=C.DEVICE))
         inputs_embeds = pad_token_embed.expand(len(sequences), max_len, hidden).clone()
         attention_mask = torch.zeros(len(sequences), max_len, device=C.DEVICE, dtype=torch.long)
         target_labels = torch.full((len(sequences), max_len), -100, device=C.DEVICE, dtype=torch.long)
@@ -120,7 +123,7 @@ class SpeechLLM(nn.Module):
             max_new_tokens=max(budgets),
             do_sample=False,
             eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
+            pad_token_id=self.pad_token_id,
             use_cache=True,
             **extra_kwargs,
         )

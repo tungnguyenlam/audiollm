@@ -12,5 +12,8 @@ jiwer==4.0.0
 pyarrow==26.0.0
 matplotlib==3.11.2
 tqdm==4.70.1
+# Vietnamese text normalisation (tone placement + numbers/units -> spoken words; lazy-loaded when LANG="vi" or --sets vi).
+underthesea==9.5.0
+vietnormalizer==0.2.3
 # Optional: fused kernel for LFM2's short convs (transformers falls back to PyTorch without it).
 # CUDA: `pip install causal-conv1d`; ROCm: built from source by setup_rocm.sh.

@@ -65,10 +65,10 @@ def make_epoch_sampler(train_items, sequence_lengths, epoch):
 
 
 def estimate_sequence_lengths(train_items, model, frame_rate):
-    """[BOS][audio][prompt][text][EOS] length of each train utterance, for BATCH_TOKENS batching."""
+    """[BOS?][audio][prompt][text][EOS] length of each train utterance, for BATCH_TOKENS batching."""
     texts = [" " + item["text"] for item in train_items]
     text_lengths = [len(ids) for ids in model.tokenizer(texts, add_special_tokens=False).input_ids]
-    prefix = 1 + len(model.prompt_token_ids)
+    prefix = int(model.tokenizer.bos_token_id is not None) + len(model.prompt_token_ids)
     return [prefix + model.projector.num_tokens(int(item["sec"] * frame_rate) + 1) + n_text + 1
             for item, n_text in zip(train_items, text_lengths)]
 
@@ -117,7 +117,7 @@ def train(args, run_dir, tracker, log_and_print, hub=None):
     Full training loop + final test eval. Writes metrics to tracker and checkpoints to run_dir; args.resume continues
     from run_dir/checkpoint/. hub (audiollm.hub.HubSync or None) gets the run dir pushed after every checkpoint.
     """
-    log_and_print(f"model {C.MODEL} | device {torch.cuda.get_device_name(0)} | dtype {C.DTYPE} | precision {C.PRECISION}")
+    log_and_print(f"model {C.MODEL} | lang {C.LANG} | device {torch.cuda.get_device_name(0)} | dtype {C.DTYPE} | precision {C.PRECISION}")
 
     # Load dataset splits
     train_items = load_train_items()

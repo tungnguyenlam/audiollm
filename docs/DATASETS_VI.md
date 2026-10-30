@@ -1,7 +1,8 @@
-# Vietnamese datasets (survey, 2026-10-29)
+# Vietnamese datasets (survey, 2026-10-29; pipeline wired 2026-10-30)
 
-This survey asks whether we can fine-tune the log-mel → `Linear` projector → LFM2.5 model to understand Vietnamese,
-and which data we would use. **Nothing here has been downloaded into `data/`, and no code supports Vietnamese yet.**
+This survey asks whether we can fine-tune the log-mel → projector → LLM model to understand Vietnamese, and which data
+we would use. **Pipeline support (`--lang vi`, `audiollm/vietnamese.py`, `download_corpora.py --vi_stage1`,
+`unpack_parquet_asr_corpora.py`, `benchmark.py --sets vi`) is wired up; see [Section 7](#7-suggested-plan) for commands.**
 It uses the same label tiers (S/A/B/C) as [`DATASETS.md`](DATASETS.md#1-how-the-label-quality-tiers-are-defined).
 
 **How it was checked:** "Verified" means we hit the HF API, downloaded files or ran code on 2026-10-29. "Card" means we
@@ -53,8 +54,9 @@ need thousands of hours.
 
 **Options, cheapest first:**
 - **(a) Keep the tokenizer and measure the cost.** Run LFM2.5 with byte fallback as a baseline ablation.
-- **(b) Switch to a backbone that covers Vietnamese.** Qwen3-0.6B, Gemma-3-270M/1B or Sailor2-1B. This is the
-  usual choice in published work (Sailor, SeaLLM, EuroLLM).
+- **(b) Switch to a backbone that covers Vietnamese.** Qwen3-0.6B (`hidden_size=1024`, matching LFM2.5-230M so
+  `--init_proj_from` transfers the trained 12.5 Hz `ConvAudioProjector` directly), Gemma-3-270M/1B or Sailor2-1B. This
+  is the usual choice in published work (Sailor, SeaLLM, EuroLLM).
 - **(c) Expand the vocabulary, Liquid-style** ([arXiv 2607.15232](https://arxiv.org/abs/2607.15232)):
   - continue the BPE merges;
   - initialise each new row as the mean of its sub-token embeddings;
@@ -195,40 +197,74 @@ There is no common standard. Common practice:
 - **Text:** NFC, lowercase, punctuation stripped.
 - **Numbers:** in **spoken form** (GigaSpeech2, VLSP, the leaderboard).
 
-`benchmark.py`'s Whisper English normaliser is not suitable. For Vietnamese scoring, apply the same steps to both
-reference and hypothesis:
+`benchmark.py`'s Whisper English normaliser is not suitable. For Vietnamese scoring (and `--lang vi` training targets),
+`audiollm/vietnamese.py:normalize_vi_text` applies the same 5 steps to both reference and hypothesis:
 
-1. `unicodedata.normalize("NFC")`.
-2. **Unify tone placement** ("hoà"→"hòa", "thuỷ"→"thủy"): NFC alone does not do this. `underthesea`'s
-   `text_normalize` does (tested with underthesea 9.5.0). It also splits off punctuation, which is harmless here.
-3. **Digits, dates and currency → words:** `vietnormalizer` (tested, works). Do **not** use `num2words(lang="vi")`:
-   it writes "lẻ", while the leaderboard writes "không trăm". `vinorm` does not import on Python 3.12.
-   `PhoTextNormalization` (mBART-large, 0.6B) is too heavy for a scoring loop.
+1. `unicodedata.normalize("NFC")` + expand HTML superscripts/units (`km<sup>2</sup>` → `ki lô mét vuông`, `m<sup>3</sup>` → `mét khối`).
+2. **Digits, dates and currency → words:** `vietnormalizer` (`enable_transliteration=False` so foreign proper nouns are
+   not corrupted; skipped on pure-letter utterances for speed). Do **not** use `num2words(lang="vi")`: it writes
+   "hai nghìn lẻ hai mươi bốn", while Vietnamese ASR corpora write "hai nghìn không trăm hai mươi tư". `vinorm` does not
+   import on Python 3.12. `PhoTextNormalization` (mBART-large, 0.6B) is too heavy for a scoring loop.
+3. **Unify tone placement** ("hoà"→"hòa", "thuỷ"→"thủy"): NFC alone does not do this. `underthesea`'s
+   `text_normalize` does (tested with underthesea 9.5.0).
 4. Lowercase, strip punctuation, collapse whitespace.
-5. **Map spelled-number variants:** linh→lẻ, ngàn→nghìn, and "mươi bốn"→"mươi tư".
+5. **Map spelled-number variants:** number-context `linh`→`lẻ` (preserving lexical words like `linh kiện`), `ngàn`→`nghìn`,
+   and `"mươi bốn"`→`"mươi tư"`.
 
-**Training targets:** use spoken form, lowercase. Turn written-form corpora (FLEURS, LSVSC; ViMD is already spoken
-form) into spoken form once, offline. NeMo-text-processing has Vietnamese TN/ITN grammars if we later want written
-output.
+**Training targets (`--lang vi`):** spoken form, lowercase, via `normalize_vi_text`. Raw transcripts stay intact in
+`manifest.jsonl`. NeMo-text-processing has Vietnamese TN/ITN grammars if we later want written output.
 
-## 7. Suggested plan
+## 7. Suggested plan & CLI commands
 
-Not started. This is a starting point for later.
+Pipeline code is wired up and verified on CPU (`audiollm/vietnamese.py`, `--lang vi`, optional-BOS/PAD `SpeechLLM` for
+`Qwen/Qwen3-0.6B-Base` and `google/gemma-3-270m`, `download_corpora.py --vi_stage1`, `unpack_parquet_asr_corpora.py`,
+`benchmark.py --sets vi`).
 
-1. **Choose the backbone first.** It is a design decision. Run the same ~100 h experiment twice, once on LFM2.5-230M
-   (byte fallback) and once on a Vietnamese-capable backbone of similar size (Qwen3-0.6B or Gemma-3-270M).
-   - Training data: PhoAudiobook slice + VLSP2020 + LSVSC.
-   - Evaluation: GS2-vi test (needs the gate), FLEURS-vi and ViMD test.
-   - The gap between the two tells us what the tokenizer costs.
-2. **Stage 1 data (~300–400 h, labels A/S, all downloadable today, about 50 GB):**
-   - PhoAudiobook subset, 16 kHz;
-   - VLSP2020;
-   - LSVSC;
-   - ViMD train (NC-ND);
-   - FOSD.
+```bash
+# 1. Download Stage 1 Vietnamese corpora + eval sets (~67.6 GB raw parquet) & unpack to 16 kHz FLAC
+python download_corpora.py --vi_stage1
+python unpack_parquet_asr_corpora.py --workers 2 \
+    gigaspeech2_vi/validation gigaspeech2_vi/test \
+    fleurs_vi/train fleurs_vi/validation fleurs_vi/test \
+    vlsp2020_100h/train lsvsc/train lsvsc/validation lsvsc/test \
+    vimd/train vimd/validation vimd/test fpt_fosd/train \
+    phoaudiobook_200h/train phoaudiobook_200h/validation phoaudiobook_200h/test
+
+# 2a. Backbone A/B arm 1: LFM2.5-230M-Base (byte fallback; warm-start projector+LoRA or projector-only from D/E2, higher token cap)
+python train.py --lang vi --model LiquidAI/LFM2.5-230M-Base \
+    --init_proj_from runs/latest_model --projector conv --stack 8 \
+    --train_split "phoaudiobook_200h/train+vlsp2020_100h/train+lsvsc/train+vimd/train+fpt_fosd/train" \
+    --val_split "gigaspeech2_vi/validation,fleurs_vi/validation,vimd/validation,lsvsc/validation" \
+    --test_splits --benchmark_sets vi --max_tokens_per_sec 16 \
+    --batch_tokens 4096 --grad_accum 8 --precision amp --lr 2e-4 --proj_lr_mult 2.5 \
+    --warmup_steps 500 --min_lr_ratio 0.1 --train_steps 19200 --eval_every 1000 --checkpoint_every 1000
+
+# 2b. Backbone A/B arm 2: Qwen/Qwen3-0.6B-Base (native vi vocab 1.17 tok/word; hidden_size=1024 -> reuses 1024-d ConvAudioProjector!)
+python train.py --lang vi --model Qwen/Qwen3-0.6B-Base \
+    --init_proj_from runs/latest_model --projector conv --stack 8 \
+    --train_split "phoaudiobook_200h/train+vlsp2020_100h/train+lsvsc/train+vimd/train+fpt_fosd/train" \
+    --val_split "gigaspeech2_vi/validation,fleurs_vi/validation,vimd/validation,lsvsc/validation" \
+    --test_splits --benchmark_sets vi --max_tokens_per_sec 8 \
+    --batch_tokens 4096 --grad_accum 8 --precision amp --lr 2e-4 --proj_lr_mult 2.5 \
+    --warmup_steps 500 --min_lr_ratio 0.1 --train_steps 19200 --eval_every 1000 --checkpoint_every 1000
+
+# 3. Benchmark & compare against PhoWhisper / Whisper baselines
+python benchmark.py hf:vinai/PhoWhisper-small --sets vi
+python benchmark.py --table --sets vi
+```
+
+1. **Choose the backbone first.** Run the same Stage 1 experiment twice: once on `LiquidAI/LFM2.5-230M-Base` (byte
+   fallback, `--max_tokens_per_sec 16`) and once on `Qwen/Qwen3-0.6B-Base` (1.17–1.42 tok/word, `hidden_size=1024` so
+   `--init_proj_from` directly transfers the English-aligned 12.5 Hz `ConvAudioProjector`).
+2. **Stage 1 data (~500 h, labels A/S, all downloadable via `--vi_stage1`, ~68 GB raw):**
+   - `phoaudiobook_200h` (~186 h slice, 16 kHz; full 1,494 h `phoaudiobook` also in `download_corpora.py`);
+   - `vlsp2020_100h` (~100 h);
+   - `lsvsc` (~100 h);
+   - `vimd` (~81 h train, resampled from 44.1/48 kHz to 16 kHz, NC-ND);
+   - `fpt_fosd` (~26 h, MP3 decoded to 16 kHz FLAC).
 3. **Stage 2 (thousands of hours, label C):**
-   - GigaSpeech 2 vi refined, after the gate (~824 GB, larger than our 100 GB `data/` budget, so stream it or take a
-     subset);
+   - Full `phoaudiobook` (1,494 h);
+   - GigaSpeech 2 vi refined, after the gate (~824 GB, stream or take a subset);
    - LEMAS vi, after an audit;
    - VietSpeech and Bud500, filtered the PhoASR way (keep clips at WER < 5% against a strong teacher).
 4. **Understanding tasks:** only after ASR works. Start with SEA-SpeechBench vi for eval, and ViSQA / ViSEC /

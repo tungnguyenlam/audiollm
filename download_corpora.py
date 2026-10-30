@@ -9,9 +9,9 @@ from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
-# name: (repo_id, allow_patterns, target_dir, approx_gb, kind 'asr'|'understanding')
+# name: (repo_id, allow_patterns, target_dir, approx_gb, kind 'asr'|'asr_vi'|'understanding')
 REGISTRY = {
-    # Default active corpora (human-transcribed, high-quality; planned total ~58 GB <= 65 GB budget)
+    # Default active English corpora (human-transcribed, high-quality; planned total ~58 GB <= 65 GB budget)
     "librispeech_clean360": ("openslr/librispeech_asr", ["all/train.clean.360/*", "all/validation.other/*"], "data/LibriSpeech", 23.5, "asr"),
     "ami_ihm": ("edinburghcstr/ami", ["ihm/*"], "data/corpora/ami_ihm", 15.2, "asr"),
     "fleurs_en": ("google/fleurs", ["parquet-data/en_us/*"], "data/corpora/fleurs_en", 2.4, "asr"),
@@ -24,7 +24,7 @@ REGISTRY = {
     "mmau_mini": ("lmms-lab-audio/mmau", ["data/test_mini*"], "data/corpora/mmau_mini", 1.2, "understanding"),
     "air_bench": ("pbcong/AIR-bench", ["Chat/*"], "data/corpora/air_bench", 0.3, "understanding"),
 
-    # Optional / off-by-default corpora (large or lower SNR, runnable via --only <name>)
+    # Optional / off-by-default English corpora (large or lower SNR, runnable via --only <name>)
     "librispeech_other500": ("openslr/librispeech_asr", ["all/train.other.500/*"], "data/LibriSpeech", 30.8, "asr"),
     "tedlium3": ("sanchit-gandhi/tedlium-data", ["data/*"], "data/corpora/tedlium3", 52.7, "asr"),
     "voxpopuli_en": ("facebook/voxpopuli", ["en/*"], "data/corpora/voxpopuli_en", 98.8, "asr"),
@@ -40,6 +40,17 @@ REGISTRY = {
     "vggsound": ("Loie/VGGSound", None, "data/corpora/vggsound", 338.2, "understanding"),
     "fsd50k": ("nateraw/fsd50k", ["data/*"], "data/corpora/fsd50k", 23.3, "understanding"),
     "meld": ("declare-lab/MELD", None, "data/corpora/meld", 11.8, "understanding"),
+
+    # Vietnamese ASR corpora & benchmarks (see docs/DATASETS_VI.md; shortcut: --vi_stage1)
+    "gigaspeech2_vi_eval": ("doof-ferb/gigaspeech2_vie", ["data/validation-*", "data/test-*"], "data/corpora/gigaspeech2_vi", 2.5, "asr_vi"),
+    "fleurs_vi": ("google/fleurs", ["parquet-data/vi_vn/*"], "data/corpora/fleurs_vi", 1.5, "asr_vi"),
+    "vlsp2020_100h": ("doof-ferb/vlsp2020_vinai_100h", ["data/*"], "data/corpora/vlsp2020_100h", 12.0, "asr_vi"),
+    "lsvsc": ("doof-ferb/LSVSC", ["data/*"], "data/corpora/lsvsc", 12.0, "asr_vi"),
+    "vimd": ("nguyendv02/ViMD_Dataset", ["data/*"], "data/corpora/vimd", 16.0, "asr_vi"),
+    "fpt_fosd": ("doof-ferb/fpt_fosd", ["data/*"], "data/corpora/fpt_fosd", 2.6, "asr_vi"),
+    # Stage 1 (~186 h slice = first 100/803 train shards + full val/test) vs full 1,494 h PhoAudiobook
+    "phoaudiobook_200h": ("thivux/phoaudiobook", ["data/train-000*.parquet", "data/validation-*", "data/test-*"], "data/corpora/phoaudiobook_200h", 21.0, "asr_vi"),
+    "phoaudiobook": ("thivux/phoaudiobook", ["data/*"], "data/corpora/phoaudiobook", 167.0, "asr_vi"),
 }
 
 DEFAULT_ENABLED = [
@@ -54,6 +65,16 @@ DEFAULT_ENABLED = [
     "cremad",
     "mmau_mini",
     "air_bench",
+]
+
+VI_STAGE1 = [
+    "gigaspeech2_vi_eval",
+    "fleurs_vi",
+    "vlsp2020_100h",
+    "lsvsc",
+    "vimd",
+    "fpt_fosd",
+    "phoaudiobook_200h",
 ]
 
 
@@ -98,23 +119,30 @@ def main():
     parser = argparse.ArgumentParser(description="Download ASR and audio understanding corpora from Hugging Face.")
     parser.add_argument("--list", action="store_true", help="List all corpora in the registry")
     parser.add_argument("--only", type=str, default=None, help="Comma-separated corpus names to download")
+    parser.add_argument("--vi_stage1", action="store_true",
+                        help=f"Download Vietnamese Stage 1 + benchmark suite ({','.join(VI_STAGE1)})")
     args = parser.parse_args()
 
     if args.list:
-        print(f"{'Name':22} {'Repo ID':30} {'GB':>6}  {'Kind':13} {'Default':8} {'Status':10}")
-        print("-" * 96)
+        print(f"{'Name':22} {'Repo ID':32} {'GB':>6}  {'Kind':13} {'Default':8} {'Status':10}")
+        print("-" * 98)
         for name, (repo_id, _, target_dir, gb, kind) in REGISTRY.items():
-            is_def = "yes" if name in DEFAULT_ENABLED else "off"
+            is_def = "yes" if name in DEFAULT_ENABLED else ("vi_s1" if name in VI_STAGE1 else "off")
             if name.startswith("librispeech_"):
                 split_name = "train-clean-360" if "clean" in name else "train-other-500"
                 done = (Path("data/LibriSpeech") / split_name / ".done").exists()
             else:
                 done = (Path(target_dir) / ".done").exists()
             status = "done" if done else "pending"
-            print(f"{name:22} {repo_id:30} {gb:6.1f}  {kind:13} {is_def:8} {status:10}")
+            print(f"{name:22} {repo_id:32} {gb:6.1f}  {kind:13} {is_def:8} {status:10}")
         return
 
-    targets = [x.strip() for x in args.only.split(",")] if args.only else DEFAULT_ENABLED
+    if args.only:
+        targets = [x.strip() for x in args.only.split(",") if x.strip()]
+    elif args.vi_stage1:
+        targets = VI_STAGE1
+    else:
+        targets = DEFAULT_ENABLED
     total_planned = sum(REGISTRY[t][3] for t in targets if t in REGISTRY)
     print(f"Starting downloads for {len(targets)} corpora (~{total_planned:.1f} GB total planned): {targets}\n")
 

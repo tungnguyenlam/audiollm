@@ -14,13 +14,17 @@ import runs as runs_lib
 from audiollm import config as C
 from audiollm.data import SpeechDataset, create_dataloader, load_split
 from audiollm.utils import compute_context, make_progress_bar
+from audiollm.vietnamese import normalize_vi_text
 
 
 def normalize_text_for_wer(text):
     """
     Standardize text for Word Error Rate (WER) computation:
-    lowercase, retain only letters/digits/apostrophes/spaces, and collapse multiple spaces.
+    English: lowercase, retain only [a-z0-9' ], collapse whitespace.
+    Vietnamese (LANG="vi"): 5-step NFC + tone placement + spoken-number normaliser (audiollm/vietnamese.py).
     """
+    if C.LANG == "vi":
+        return normalize_vi_text(text)
     text = re.sub(r"[^a-z0-9' ]", " ", text.lower())
     return re.sub(r"\s+", " ", text).strip()
 

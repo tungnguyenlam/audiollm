@@ -18,6 +18,7 @@ import torch
 RUN_NAME = ""                # run directory suffix; empty = auto "<model>_stack<STACK>" (e.g. LFM2.5-230M-Base_stack16)
 SEED = 0                     # Random seed for reproducibility
 MODEL = "LiquidAI/LFM2.5-230M-Base"  # small model for fast experiments (2.6B-Base is the paper-scale target)
+LANG = "en"                  # transcript language for train targets & val/test WER: "en" (ASCII [a-z0-9' ]) | "vi" (NFC + tone placement + spoken numbers; audiollm/vietnamese.py)
 DATA = "data/LibriSpeech"    # Path to dataset directory
 ASR_CORPORA = "data/asr_corpora"  # unpacked non-LibriSpeech corpora (unpack_parquet_asr_corpora.py), addressed as "<corpus>/<split>"
 TRAIN_SPLIT = "train-clean-100+train-clean-360+ami_ihm/train+fleurs_en/train"  # Training split(s), "+"-joined: LibriSpeech names or "<corpus>/<split>" (100+360 h read speech, ~80 h AMI meetings, ~7 h FLEURS); "train-clean-100" = pre-2026-10-27 runs. "<split>*K" repeats a split K times per epoch (fractional K adds a seeded random subset), e.g. "fleurs_en/train*6"
@@ -108,7 +109,7 @@ LOG_EVERY = 20               # Step interval for logging training progress
 EVAL_EVERY = 500             # Evaluate on validation split every N optimizer steps
 EVAL_BATCH_SIZE = 16         # Evaluation batch size
 MAX_NEW_TOKENS = 256         # Hard cap on generated tokens during evaluation (pre-2026-10-27 runs: 200)
-MAX_TOKENS_PER_SEC = 6.0     # Per-utterance decode cap: ceil(MAX_TOKENS_PER_SEC * sec) + MAX_TOKENS_PAD tokens (0 = only MAX_NEW_TOKENS); no train transcript exceeds 6*sec+10
+MAX_TOKENS_PER_SEC = 6.0     # Per-utterance decode cap: ceil(MAX_TOKENS_PER_SEC * sec) + MAX_TOKENS_PAD tokens (0 = only MAX_NEW_TOKENS); no train transcript exceeds 6*sec+10 (use ~18 for LFM2.5 on Vietnamese byte-fallback)
 MAX_TOKENS_PAD = 10          # Constant slack added to the per-utterance cap
 NO_REPEAT_NGRAM_SIZE = 4     # >0: forbid repeating any n-gram of this size in a hypothesis (HF generate); 0 = off (pre-2026-10-27 runs). 4 won the decode A/B (WORKLOG)
 NUM_WORKERS = 8              # Number of DataLoader worker processes
@@ -116,7 +117,7 @@ LOG_N_EXAMPLES = 2           # Number of (ref, hyp) examples printed after each 
 PLOT_EVERY = 100             # Re-draw runs/<id>/plots.png (+ runs/INDEX.md) every N optimizer steps and after each val
 CHECKPOINT_EVERY = 0         # >0: every N optimizer steps, save a resumable checkpoint (LoRA + projector + optimizer + LR schedule + data position + RNG) to runs/<id>/checkpoint/, replacing the previous one; continue with `train.py --resume runs/<id>`. Deleted once the run finishes
 HUB_REPO = ""                # Hugging Face Hub model repo ("user/name", created private if missing) that runs/<id>/ is mirrored to as <repo>/<id>/ at every checkpoint and at the end; pull it back with `runs.py pull`. "" = off
-BENCHMARK_SETS = "all"       # After training + test eval, run benchmark.py with the in-memory model: "all" (7 Open ASR sets + local fleurs_en/edacc test sets), "openasr", comma list (e.g. "librispeech_clean,ami") or "none"
+BENCHMARK_SETS = "all"       # After training + test eval, run benchmark.py with the in-memory model: "all" (7 Open ASR sets + local fleurs_en/edacc test sets), "openasr", "vi" (local Vietnamese test sets), comma list (e.g. "librispeech_clean,ami") or "none"
 
 DEVICE = "cuda"              # Compute device (cuda or cpu)
 DTYPE = torch.bfloat16       # Base model torch dtype
@@ -126,12 +127,14 @@ PRECISION = "bf16"           # bf16: LoRA+proj weights/grads/AdamW states in DTY
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 PRECISIONS = ("bf16", "amp", "fp32")  # tuple, so it is not picked up as a config constant
 OPTIMIZERS = ("adamw", "muon")
+LANGS = ("en", "vi")
 # Keys whose value changed after older runs were saved: a config.json without the key gets the old behaviour back.
 LEGACY_DEFAULTS = {
     "PRECISION": "fp32",     # runs from before PRECISION existed trained fp32 LoRA + projector
     "PROJ_INIT": "default",  # PyTorch's nn.Linear init before PROJ_INIT existed
     "MIN_TRAIN_SEC": 0.0,    # no minimum length before MIN_TRAIN_SEC existed
     "PROJECTOR": "linear",
+    "LANG": "en",
 }
 
 
@@ -222,6 +225,8 @@ def build_arg_parser():
             kwargs["choices"] = PRECISIONS
         elif key == "OPTIMIZER":
             kwargs["choices"] = OPTIMIZERS
+        elif key == "LANG":
+            kwargs["choices"] = LANGS
         elif key == "PROJECTOR":
             kwargs["choices"] = list(PROJECTORS)
         else:

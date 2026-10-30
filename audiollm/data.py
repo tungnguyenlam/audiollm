@@ -14,6 +14,7 @@ import soundfile as sf
 import torch
 
 from audiollm import config as C
+from audiollm.vietnamese import normalize_vi_text
 
 
 # ---------------------------------------------------------------- corpora
@@ -50,7 +51,9 @@ def load_librispeech_split(split_name):
 
 
 def normalize_training_text(text):
-    """Training target / reference text: strip annotation tags, lowercase ASCII, keep letters/digits/apostrophes."""
+    """Training target / reference text: English ASCII [a-z0-9' ], or Vietnamese NFC + spoken numbers (LANG='vi')."""
+    if C.LANG == "vi":
+        return normalize_vi_text(text)
     if text.strip() == "IGNORE_TIME_SEGMENT_IN_SCORING":
         return ""
     text = re.sub(r"<[^>]+>|\[[^\]]+\]", " ", text)

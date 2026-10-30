@@ -438,3 +438,24 @@ Earlier months: `docs/worklog_archive/YYYY-MM.md`.
 - Large but label C: GigaSpeech2-vi 6k h (gate + Google Form; its 11 h professional test set is the main benchmark), LEMAS-vi 6.6k h (not yet audited), VietSpeech, Bud500 (PhoASR kept about 50%).
 - Reject as is: VietSuperSpeech (pseudo-labels, 17% English gibberish, 51.6% CER; card's hours wrong).
 - Not started: vi data loader, vi WER normaliser in benchmark.py, choice of backbone.
+
+## 2026-10-30 - E2 (~3180 h: D + GigaSpeech M + SPGISpeech S) launched with token-budget batching
+- Run `20261030-153827_mix3200h_gs_spgi_conv_stack8_cont4_19k` (`systemd-run --user` unit `stage-e2-3200h`, auto-resumable `--checkpoint_every 1000`):
+  warm-started from D (`20261029-074100_mix2000h_vox_ted_conv_stack8_cont3_19k`), `TRAIN_SPLIT` = D + `gigaspeech_m/train` + `spgispeech_s/train`
+  (1,783,428 utts / 3,179.4 h in [1, 30] s), 19.2k steps, `lr=1e-4` (`proj_lr=2.5e-4`), `warmup=300`, `min_lr_ratio=0.1`.
+- Switched from fixed `bs=16, ga=2` to token-budget batching `--batch_tokens 4096 --grad_accum 8` (~32k tokens/step, matching D's effective tokens/step):
+  pad efficiency 91-93%, ~0.45-0.60 s/step (~330-490x realtime vs ~0.8-1.0 s/step in D), 6.9 GB peak VRAM, ETA ~3.5 h.
+- 8-split validation (`dev-clean,ami_ihm/validation,fleurs_en/validation,dev-other,voxpopuli_en/validation,tedlium3/validation,gigaspeech_m/validation,spgispeech_s/validation`,
+  200 utts each, ~1.5 min/pass). At step 1,000 (end of warmup): `spgispeech_s` val already 60.63% (D benchmark was 77.04%),
+  `tedlium3` 41.39%, `gigaspeech_m` 59.18%, `voxpopuli_en` 48.82%, `dev-clean` 30.31%.
+
+## 2026-10-30 - Vietnamese ASR pipeline wired up (data, normaliser, optional-BOS backbones, benchmark)
+- `audiollm/vietnamese.py` (+ `underthesea==9.5.0`, `vietnormalizer==0.2.3` in `requirements.txt`): 5-step Vietnamese spoken-form normaliser
+  from `docs/DATASETS_VI.md` Section 6 (NFC + HTML superscript/unit expansion -> `vietnormalizer(enable_transliteration=False)` skipped on pure-letter strings
+  -> `underthesea.text_normalize` tone placement unification -> lowercase/strip punctuation -> number-context `linh->lẻ`, `ngàn->nghìn`, `mươi bốn->mươi tư`).
+- New `--lang` (`en` default, `vi`) in `config.py`, `data.py`, `evaluate.py`; zero behaviour change when `LANG="en"`.
+- `model.py` / `trainer.py`: `SpeechLLM` now supports tokenizers with `bos_token_id=None` (`Qwen/Qwen3-0.6B-Base`) and `pad_token_id=None`.
+  `Qwen/Qwen3-0.6B-Base` has `hidden_size=1024` matching `LFM2.5-230M-Base`, so `--init_proj_from` transfers the English-trained 12.5 Hz
+  `ConvAudioProjector` directly for the backbone A/B (`LFM2.5-230M-Base` byte fallback vs `Qwen3-0.6B-Base` 1.17 tok/word). Verified on CPU with `Qwen3-0.6B-Base` and `google/gemma-3-270m`.
+- `download_corpora.py --vi_stage1` (`gigaspeech2_vi_eval`, `fleurs_vi`, `vlsp2020_100h`, `lsvsc`, `vimd`, `fpt_fosd`, `phoaudiobook_200h`; full `phoaudiobook` also registered),
+  `unpack_parquet_asr_corpora.py` (Vietnamese sources, `--workers`, `--list`, audio-path-stem IDs when no `id` column), and `benchmark.py --sets vi` / `--table --sets vi`.
