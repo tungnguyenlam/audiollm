@@ -28,6 +28,10 @@ REGISTRY = {
     "librispeech_other500": ("openslr/librispeech_asr", ["all/train.other.500/*"], "data/LibriSpeech", 30.8, "asr"),
     "tedlium3": ("sanchit-gandhi/tedlium-data", ["data/*"], "data/corpora/tedlium3", 52.7, "asr"),
     "voxpopuli_en": ("facebook/voxpopuli", ["en/*"], "data/corpora/voxpopuli_en", 98.8, "asr"),
+    # gated (accept the terms on the HF dataset page first); parquet "m" is the cumulative M subset (1000 h, includes S).
+    # Their test-* shards are the Open ASR benchmark sets, so only train + validation are fetched
+    "gigaspeech_m": ("speechcolab/gigaspeech", ["parquet-data/m/train-*", "parquet-data/m/validation-*"], "data/corpora/gigaspeech", 116.0, "asr"),
+    "spgispeech_s": ("kensho/spgispeech", ["S/train-*", "S/validation-00000-*"], "data/corpora/spgispeech", 34.0, "asr"),
     "earnings22": ("distil-whisper/earnings22", ["chunked/*"], "data/corpora/earnings22", 24.0, "asr"),
     "libritts_r": ("mythicinfinity/libritts_r", ["data/*"], "data/corpora/libritts_r", 100.6, "asr"),
     "peoples_speech_clean": ("MLCommons/peoples_speech", ["clean/*"], "data/corpora/peoples_speech_clean", 398.6, "asr"),

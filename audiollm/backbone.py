@@ -9,11 +9,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from audiollm import config as C
 from audiollm.utils import trainable_dtype
 
+# Backbones that ship their own modelling code. trust_remote_code runs the repo's Python, so it is pinned to the
+# commit whose .py files were read (imports only torch / transformers / triton).
+REMOTE_CODE_REVISIONS = {"LiquidAI/LFM3-1.7B-Base": "545fc8f4c7b5fa9f405105274cd29c4f8f44b526"}
+
 
 def load_llm():
     """(tokenizer, base LLM on DEVICE in DTYPE), no adapter yet."""
-    tokenizer = AutoTokenizer.from_pretrained(C.MODEL)
-    llm = AutoModelForCausalLM.from_pretrained(C.MODEL, dtype=C.DTYPE).to(C.DEVICE)
+    remote = {"trust_remote_code": True, "revision": REMOTE_CODE_REVISIONS[C.MODEL]} if C.MODEL in REMOTE_CODE_REVISIONS else {}
+    tokenizer = AutoTokenizer.from_pretrained(C.MODEL, **remote)
+    llm = AutoModelForCausalLM.from_pretrained(C.MODEL, dtype=C.DTYPE, **remote).to(C.DEVICE)
     return tokenizer, llm
 
 

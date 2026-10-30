@@ -4,6 +4,7 @@ import math
 import random
 import shutil
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -154,6 +155,9 @@ def train(args, run_dir, tracker, log_and_print, hub=None):
         log_and_print(f"resume: LoRA + projector weights from {checkpoint_dir}")
     elif C.INIT_FROM:
         log_and_print(f"init: LoRA + projector weights from {C.INIT_FROM} (fresh optimizer and LR schedule)")
+    elif C.INIT_PROJ_FROM:
+        model.projector.load_checkpoint(torch.load(Path(C.INIT_PROJ_FROM, "proj.pt"), map_location=C.DEVICE))
+        log_and_print(f"init: projector weights from {C.INIT_PROJ_FROM}, fresh LoRA")
     if C.GRAD_CKPT:
         model.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.train()

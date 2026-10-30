@@ -62,7 +62,7 @@ from audiollm.utils import seed_everything
 
 def main():
     args, config = C.parse_args()
-    if config["INIT_FROM"] and not (args.eval_only or args.resume):  # a resumed config is already resolved
+    if (config["INIT_FROM"] or config["INIT_PROJ_FROM"]) and not (args.eval_only or args.resume):  # a resumed config is already resolved
         config = resolve_init_from(config)
     C.apply_config(config)
     seed_everything(C.SEED)
@@ -178,19 +178,23 @@ def main():
 
 INIT_MUST_MATCH = ("MODEL", "STACK", "N_MELS", "SR", "N_FFT", "HOP", "MVN_N", "PROJECTOR", "LORA_R", "LORA_ALPHA",
                    "LORA_TARGETS", "PROMPT")
+INIT_PROJ_MUST_MATCH = ("STACK", "N_MELS", "SR", "N_FFT", "HOP", "MVN_N", "PROJECTOR")
 
 
 def resolve_init_from(config):
     """
-    INIT_FROM: check the init run's architecture / feature keys match this config, and (unless MVN_SPLIT is set)
-    reuse the init run's MVN stats so the warm-started weights see identically normalised mel features.
+    INIT_FROM / INIT_PROJ_FROM: check the init run's architecture / feature keys match this config, and (unless
+    MVN_SPLIT is set) reuse the init run's MVN stats so the warm-started weights see identically normalised mel features.
     """
-    init_config = C.with_legacy_defaults(json.load(open(Path(config["INIT_FROM"], "config.json"))))
-    mismatched = {key: (init_config.get(key), config[key]) for key in INIT_MUST_MATCH
-                  if key in init_config and init_config[key] != config[key]}
+    if config["INIT_FROM"] and config["INIT_PROJ_FROM"]:
+        raise SystemExit("INIT_FROM already loads the projector; pass only one of INIT_FROM / INIT_PROJ_FROM")
+    key, must_match = ("INIT_FROM", INIT_MUST_MATCH) if config["INIT_FROM"] else ("INIT_PROJ_FROM", INIT_PROJ_MUST_MATCH)
+    init_config = C.with_legacy_defaults(json.load(open(Path(config[key], "config.json"))))
+    mismatched = {name: (init_config.get(name), config[name]) for name in must_match
+                  if name in init_config and init_config[name] != config[name]}
     if mismatched:
-        raise SystemExit(f"INIT_FROM {config['INIT_FROM']}: config differs from the init run as (init, now): "
-                         f"{mismatched}; pass e.g. --config {config['INIT_FROM']}/config.json")
+        raise SystemExit(f"{key} {config[key]}: config differs from the init run as (init, now): "
+                         f"{mismatched}; pass e.g. --config {config[key]}/config.json")
     if not config["MVN_SPLIT"]:
         config = dict(config, MVN_SPLIT=init_config.get("MVN_SPLIT") or unweighted_split(init_config["TRAIN_SPLIT"]))
     return config
@@ -210,7 +214,7 @@ def override_name_suffix(config):
              "SPECAUG_FREQ_MASKS": "fm", "SPECAUG_FREQ_WIDTH": "fw", "SPECAUG_TIME_MASKS": "tm",
              "SPECAUG_TIME_WIDTH": "tw", "SPECAUG_MAX_TIME_RATIO": "tr"}
     skip = runs_lib.IGNORED_KEYS | {"MODEL", "STACK", "EVAL_EVERY", "VAL_N", "TEST_SPLITS", "DATA", "MAX_NEW_TOKENS",
-                                    "MAX_TOKENS_PER_SEC", "MAX_TOKENS_PAD", "NO_REPEAT_NGRAM_SIZE", "INIT_FROM", "MVN_SPLIT",
+                                    "MAX_TOKENS_PER_SEC", "MAX_TOKENS_PAD", "NO_REPEAT_NGRAM_SIZE", "INIT_FROM", "INIT_PROJ_FROM", "MVN_SPLIT",
                                     "EVAL_AUDIO_ABLATIONS"}
     parts = []
     for key, val in config.items():

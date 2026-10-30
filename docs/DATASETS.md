@@ -17,6 +17,9 @@ corpora are downloaded by default. Everything else is in the registry but switch
 > for them exists yet. Numbers marked "~" are approximate, and corpus releases differ, so check the paper or the
 > dataset card before quoting a number.
 
+> Vietnamese corpora, eval sets and the tokenizer question are surveyed separately in
+> [`DATASETS_VI.md`](DATASETS_VI.md).
+
 ## Contents
 1. [How the label-quality tiers are defined](#1-how-the-label-quality-tiers-are-defined)
 2. [ASR corpora: ranking](#2-asr-corpora-ranking)

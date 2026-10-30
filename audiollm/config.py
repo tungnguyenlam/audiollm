@@ -23,6 +23,7 @@ ASR_CORPORA = "data/asr_corpora"  # unpacked non-LibriSpeech corpora (unpack_par
 TRAIN_SPLIT = "train-clean-100+train-clean-360+ami_ihm/train+fleurs_en/train"  # Training split(s), "+"-joined: LibriSpeech names or "<corpus>/<split>" (100+360 h read speech, ~80 h AMI meetings, ~7 h FLEURS); "train-clean-100" = pre-2026-10-27 runs. "<split>*K" repeats a split K times per epoch (fractional K adds a seeded random subset), e.g. "fleurs_en/train*6"
 MVN_SPLIT = ""               # split spec whose cached MVN stats normalise the mel features; "" = TRAIN_SPLIT without "*K" weights (INIT_FROM runs inherit the init run's)
 INIT_FROM = ""               # run dir to initialise LoRA + projector weights from (fresh optimizer, warmup and schedule), e.g. runs/20261027-150147_mix544h_conv_stack8; "" = fresh init
+INIT_PROJ_FROM = ""          # run dir to initialise only the projector from (fresh LoRA), e.g. a 230M run's projector into a 350M run (same hidden size); "" = off
 MIN_TRAIN_SEC = 1.0          # drop shorter train utts (mostly AMI back-channels like "yeah", "mm-hmm")
 VAL_SPLIT = "dev-clean,ami_ihm/validation,fleurs_en/validation"  # comma list of dev splits, each scored separately (one per training corpus); the FIRST one picks best_val_wer, "dev-clean" = pre-2026-10-28 runs
 VAL_N = 200                  # utts per dev split: LibriSpeech = first VAL_N by id (comparable to older runs), corpora = SEED-fixed sample of utts in [MIN_TRAIN_SEC, MAX_TRAIN_SEC]

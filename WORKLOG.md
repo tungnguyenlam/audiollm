@@ -353,3 +353,88 @@ Earlier months: `docs/worklog_archive/YYYY-MM.md`.
 - Not now: ~3-epoch runs would save only ~14% (epoch 1 is unscored), and data volume, not compute, is our lever.
   Best testbed is the ~14-epoch 100 h config. Planned arms: baseline / real loss / random scores.
 - Design, implementation sketch and verified citations: `docs/idea_loss_based_soft_pruning.md`.
+
+## 2026-10-29 - +train-other-500 vs same-data control: unique hours beat extra steps on all 9 sets
+- B `20261028-171756_mix1040h_conv_stack8_cont2_19k` (1040 h) vs C `20261028-215900_mix544h_conv_stack8_cont2_19k`
+  (544 h control). Both: warm start from cont19k, +19.2k steps, same config; only TRAIN_SPLIT differs.
+
+  | WER % | cont19k | C 544 h | B 1040 h |
+  |---|---|---|---|
+  | librispeech clean / other | 36.9 / 66.2 | 31.8 / 62.5 | **25.1 / 49.4** |
+  | ami / gigaspeech / voxpopuli | 57.2 / 73.3 / 94.2 | 54.2 / 70.2 / 91.0 | **52.2 / 64.4 / 80.4** |
+  | spgispeech / earnings22 | 103.4 / 106.7 | 101.0 / 103.0 | **90.4 / 99.6** |
+  | fleurs_en / edacc | 91.4 / 93.2 | 88.6 / 91.1 | 87.5 / 91.4 |
+  | Open ASR 7-set mean | 76.83 | 73.38 | **65.95** |
+- Extra steps alone: -3.5 mean. +500 h unique: another -7.4 mean, with gains also on sets train-other-500 does
+  not cover (voxpopuli -10.5, spgispeech -10.6, gigaspeech -5.8). Accents (edacc, fleurs) barely move.
+- Insertion analysis on B (earnings22 / spgispeech / voxpopuli ins 19-23% vs 4% on LS-clean): not loops (<25 looping
+  hyps per set), not normaliser; hyps run 14-18% longer than refs because the LLM writes fluent audiobook-style prose
+  ("i can not", "aint") over unfamiliar acoustics. Data problem first; a MAX_TOKENS_PER_SEC sweep (6/5/4/3.5, 600
+  utts x 5 sets, tags `results/capsweep_B_cap*`) is running to see how much a decode cap can recover.
+- Decision: keep adding unique, varied hours. Downloading VoxPopuli-en (~540 h) + TED-LIUM 3 (~450 h); GigaSpeech /
+  SPGISpeech are gated (need terms accepted on HF). Queued: E `mix1040h_conv_stack8_cont3_19k` (B +19.2k steps, same
+  data, control) then D `mix2000h_vox_ted_conv_stack8_cont3_19k` (B + VoxPopuli + TED-LIUM). voxpopuli stops being
+  zero-shot in D.
+- Code: `unpack_parquet_asr_corpora.py` gains voxpopuli_en / tedlium3 sources (TED-LIUM cleaner: drop
+  ignore_time_segment_in_scoring, rejoin "it 's"), streams row batches. FLEURS re-unpack verified identical.
+  `backbone.py`: LFM3-1.7B-Base loads with trust_remote_code pinned to an audited commit (not yet smoke-tested).
+
+## 2026-10-29 - MAX_TOKENS_PER_SEC sweep on B: decode cap cannot remove the OOD insertions
+- B `mix1040h_conv_stack8_cont2_19k`, 600 evenly spaced utts per set, `results/capsweep_B_cap{6.0,5.0,4.0,3.5}`.
+  WER (ins) at cap 6.0 -> 3.5: earnings22 98.3 (22.6) -> 97.7 (22.0), voxpopuli 79.2 (21.0) -> 78.9 (20.6),
+  spgispeech 89.5 (18.7) -> 89.4 (18.5), LS clean 25.3 -> 25.3, LS other 49.7 -> 49.7.
+- Rules OUT: the length cap as a fix (<=0.6 pt even at 3.5 tok/s). Extra words are spread through utterances, not
+  run-on tails. Keep cap 6. Rules IN (again): domain data. Control E `20261029-040621_mix1040h_conv_stack8_cont3_19k`
+  started 04:06; D queued behind it and the VoxPopuli / TED-LIUM downloads (74 / 152 GB at 04:10).
+
+## 2026-10-29 - Session OOM-kill lost control run E; plan now D -> 350M, GigaSpeech M + SPGISpeech S downloading
+- 05:38 the VoxPopuli unpack (8 workers, parquet pre-buffering, ~4.8 GB RSS each) pushed RAM+swap past 90% and
+  systemd-oomd killed the whole login session, including E (`20261029-040621_mix1040h_conv_stack8_cont3_19k`, step 6083/19200, no checkpoint).
+- Fix: `unpack_parquet_asr_corpora.py` streams row batches with `pre_buffer=False` (2.1 GB peak/worker) and uses 4 workers.
+  Long jobs now run as separate `systemd-run --user` units (unpack capped at MemoryMax=14G), and training uses `--checkpoint_every 1000` plus auto `--resume`.
+- E is dropped, not rerun: B vs C already showed unique hours beat steps. D vs B is read with C's +3.5-point steps-only gain as the reference.
+- User decision: no budget for LFM3-1.7B, so the bigger-backbone test is LFM2.5-350M-Base (16 layers vs 14, same 1024 width).
+  New `INIT_PROJ_FROM` (config/train/trainer): loads only proj.pt from a run (feature/projector keys must match) and keeps LoRA fresh,
+  so the 350M starts from B's projector. Smoke test: 60 steps OK, ~1.05-1.2 s/step (230M: ~0.8).
+  The first smoke attempt died once with HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION (ROCm) at step ~30; the retry was clean. Not reproduced.
+- Queue (`queue-d-350m` user unit, log `runs_queue_d_350m.out`):
+  - D = B + VoxPopuli-en + TED-LIUM 3 (~2000 h), warm from B, 19.2k steps.
+  - Then `lfm350m_mix2000h_projinit_19k`: same data and steps as D, LR 2e-4, warmup 500.
+- The user accepted the GigaSpeech/SPGISpeech terms. `download_corpora.py` gains `gigaspeech_m` (parquet M, 1000 h, 120 GB)
+  and `spgispeech_s` (S, 200 h, 45 GB), now downloading. Training on them makes the gigaspeech/spgispeech benchmarks in-domain; earnings22 stays OOD.
+
+## 2026-10-29 - D (B + VoxPopuli-en + TED-LIUM 3, ~1983 h): big gains everywhere; 350M started
+- Run `20261029-074100_mix2000h_vox_ted_conv_stack8_cont3_19k`: B warm start, 19.2k steps, same LR schedule,
+  train = B's mix + voxpopuli_en/train (501 h) + tedlium3/train (454 h) = 796k utts. 4.2 h train, ~0.8-1 s/step.
+- Benchmark WER, B -> D: libri clean 25.12 -> 19.99, other 49.42 -> 44.58, voxpopuli 80.44 -> 40.45 (now in-domain),
+  ami 52.17 -> 46.13, earnings22 99.62 -> 87.72, gigaspeech 64.44 -> 50.54, spgispeech 90.41 -> 77.04,
+  fleurs 87.51 -> 82.95, edacc 91.35 -> 83.75. Mean of 9: 71.16 -> 59.24.
+- LibriSpeech -5 vs C's steps-only ~-3.5: new data is worth more than extra steps. Unseen sets
+  (earnings22, gigaspeech, spgispeech, edacc) improve 7-14 points, so this is not just in-domain fitting.
+- Insertions dropped a lot on OOD (earnings22 ins 22.7 -> 17.3, spgispeech 18.9 -> 14.6).
+- GigaSpeech M (910k utts, 999.9 h; val 5715 / 11.4 h) and SPGISpeech S (77k utts, 196.2 h; val 13.1k / 33.3 h)
+  unpacked. No leftover tags or empty texts. 0 source/call overlap with the ESB test shards.
+  From the next stage on, the gigaspeech/spgispeech benchmarks are in-domain; earnings22/edacc/fleurs-test stay unseen.
+- 350M run `20261029-123151_lfm350m_mix2000h_projinit_19k` (same data/steps as D, projector from B, fresh LoRA,
+  lr 2e-4) started 12:32, ~0.8 s/step, ETA ~16:45 + benchmark.
+- Next: compare 350M vs D, then a ~3200 h stage (+gigaspeech_m/train +spgispeech_s/train) on the winner.
+
+## 2026-10-29 - 350M (projector from B, fresh LoRA, 19.2k steps) far behind D; not a matched comparison
+- Run `20261029-123151_lfm350m_mix2000h_projinit_19k`: same data/steps as D, lr 2e-4, warmup 500. 4:58 train (~1.0 s/step vs ~0.8 for 230M).
+  Finished 17:33, benchmark done ~18:14 (one HIP OOM warning on edacc, recovered).
+- Benchmark WER, D (230M) -> 350M: libri clean 19.99 -> 39.53, other 44.58 -> 62.54, voxpopuli 40.45 -> 59.40,
+  ami 46.13 -> 57.43, earnings22 87.72 -> 99.51, gigaspeech 50.54 -> 65.62, spgispeech 77.04 -> 93.09,
+  fleurs 82.95 -> 95.38, edacc 83.75 -> 91.06. Mean of 9: 59.24 -> 73.73. Final train loss 0.66 vs 1.08.
+- Not a fair verdict on size: D is the 4th warm-start stage of the 230M (~70k cumulative steps), the 350M had 19.2k with fresh LoRA.
+  On the 230M's own path, test-clean was 71.0 after stage 1 (12.8k steps) and 36.8 after cont19k (~32k), so the 350M at
+  19.2k (39.5) learns about as fast per step. It does not learn clearly faster, and each step costs ~25% more.
+- Rules OUT switching to 350M now. Data was the big lever (B->D -12 mean), so the next stage stays on the 230M.
+- Next: E2 = D warm start + gigaspeech_m/train + spgispeech_s/train (~3200 h), 19.2k steps, same schedule as D.
+
+## 2026-10-29 - Survey: Vietnamese ASR / audio-understanding datasets (no code change)
+- Wrote `docs/DATASETS_VI.md` (tiers, access checked against HF today, shard-level audits with PhoWhisper-small CER spot-checks, eval sets, WER references, normalisation recipe).
+- Blocker to note first: the LFM2.5 tokenizer has no Vietnamese coverage (~3.0 tokens/word vs 1.1–1.4 for Qwen3/Gemma3/Llama3.2). Any vi run should A/B LFM2.5 against a vi-capable backbone of similar size.
+- Clean and downloadable today: PhoAudiobook (0.9% CER spot-check, 1.5k h), VLSP2020 100 h (2.2%), LSVSC 100 h (numbers need verbalising), ViMD 102 h (dialects, NC-ND).
+- Large but label C: GigaSpeech2-vi 6k h (gate + Google Form; its 11 h professional test set is the main benchmark), LEMAS-vi 6.6k h (not yet audited), VietSpeech, Bud500 (PhoASR kept about 50%).
+- Reject as is: VietSuperSpeech (pseudo-labels, 17% English gibberish, 51.6% CER; card's hours wrong).
+- Not started: vi data loader, vi WER normaliser in benchmark.py, choice of backbone.
