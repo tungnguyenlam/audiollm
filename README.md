@@ -60,11 +60,40 @@ Base LLMs used or queued for runs (pass with `--model`). The `hidden` column set
 
 ## Run
 
+### macOS / CPU setup
+
+Install Python 3.12 and `uv`, then run from the repository root:
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements-notebook.txt
+source .venv/bin/activate
+python train.py --help
+jupyter lab explore_pipeline.ipynb
+```
+
+This installs native PyTorch and the notebook tools. Training automatically selects CUDA/ROCm, Apple Metal (MPS),
+or CPU, in that order, using float32 on MPS/CPU. The notebook automatically uses CPU when CUDA is unavailable.
+For a CPU training smoke test, download the baseline splits and use float32 with a small batch:
+
+```bash
+python prepare_data.py train-clean-100 dev-clean test-clean test-other
+python train.py --device cpu --dtype float32 --precision fp32 --batch_size 1 --grad_accum 1 --num_workers 0 --val_n 2 --eval_batch_size 1 --max_new_tokens 16 --mvn_n 20 --max_steps 1
+```
+
+The baseline splits require about 7 GB; model weights are downloaded on first use. CPU training is slow;
+use a supported Linux GPU for full experiments. To install only the command-line dependencies, use
+`requirements.txt` instead of `requirements-notebook.txt`. Running `prepare_data.py` without split names also
+downloads `train-clean-360` and `dev-other` (substantially larger than the baseline).
+
+### AMD ROCm setup
+
 ```bash
 ./setup_rocm.sh                              # uv venv + ROCm torch
 ./setup_dataset.sh                           # all of data/ (~83 GB); --minimal = train.py's LibriSpeech only (~7 GB)
 ./setup_dataset.sh --check                   # verify data/ without downloading
 source .venv/bin/activate
+python prepare_data.py train-clean-100 dev-clean test-clean test-other   # ~7 GB
 python train.py --max_steps 10               # smoke test
 python train.py                              # full run (230M model)
 python train.py --run_name lr3e-4 --lr 3e-4 --notes "higher peak lr"    # override any constant via its flag
