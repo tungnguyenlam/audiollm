@@ -11,6 +11,7 @@ import torch.nn as nn
 
 from audiollm import config as C
 from audiollm.backbone import attach_lora, describe_llm, describe_lora_placement, load_llm
+from audiollm.merging import merge_tokens
 from audiollm.projectors import build_projector
 from audiollm.utils import trainable_dtype
 
@@ -72,7 +73,7 @@ class SpeechLLM(nn.Module):
         elif audio_ablation != "none":
             raise ValueError(f"unknown audio ablation {audio_ablation!r} (expected 'none', 'shuffle' or 'zeros')")
         proj_dtype = next(self.projector.parameters()).dtype
-        projected = self.projector(features.to(C.DEVICE, proj_dtype), feature_lengths.to(C.DEVICE))
+        projected = merge_tokens(self.projector(features.to(C.DEVICE, proj_dtype), feature_lengths.to(C.DEVICE)))
 
         embed_tokens = self.llm.get_input_embeddings()
         has_bos = self.tokenizer.bos_token_id is not None

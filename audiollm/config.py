@@ -94,6 +94,10 @@ WEIGHT_DECAY = 0.0           # Weight decay for optimizer
 PROJECTOR = "linear"         # audio adapter, a class in audiollm/projectors/: "linear" (nn.Linear(STACK*N_MELS -> d)) | "mlp" (LayerNorm + 2-layer GELU MLP on stacked patches) | "conv" (Mel-LLM style strided Conv1d x log2(STACK) on continuous mel + LayerNorm + 2-layer GELU MLP)
 PROJ_INIT = "match_emb"      # projector output init: "match_emb" (N(0, emb_std/sqrt(fan_in)), zero bias -> audio embeddings ~ the LLM's text-embedding scale) | "default" (PyTorch nn.Linear init, ~20x larger than text embeddings; pre-2026-10-27 runs)
 PROJ_LR_MULT = 1.0           # projector lr = LR * PROJ_LR_MULT (LoRA uses LR)
+MERGE = "none"               # adjacent merging of the projector's audio tokens (audiollm/merging.py): "none" | "affinity" (Affinity Pooling, arXiv 2604.06871: a token joins the current group if its cosine similarity with any of the group's last MERGE_WINDOW tokens exceeds MERGE_TAU; groups are mean-pooled) | "uniform" (equal-size groups, ceil(MERGE_RATIO * tokens) per utterance) | "uniform_matched" (equal-size groups, as many per utterance as "affinity" would keep: same budget, positions ignore content)
+MERGE_TAU = 0.85             # MERGE="affinity"/"uniform_matched": cosine-similarity threshold; higher keeps more tokens
+MERGE_WINDOW = 1             # MERGE="affinity"/"uniform_matched": lookback ω within the current group (1 = A-ToMe-style adjacent merging)
+MERGE_RATIO = 0.5            # MERGE="uniform": fraction of audio tokens kept per utterance
 PROJ_ONLY_STEPS = 0          # optimizer steps with LoRA frozen (only the projector trains) before LoRA joins with its own WARMUP_STEPS warmup
 OPTIMIZER = "adamw"          # "adamw" (all trainable params) | "muon" (torch.optim.Muon on every trainable 2D linear weight = LoRA A/B + projector weight; no AdamW anywhere, so the projector bias is frozen at init; the LLM's depthwise conv is frozen either way)
 MUON_ADJUST_LR = "match_rms_adamw"  # Muon per-matrix lr scaling: "match_rms_adamw" (update RMS ~ AdamW's, so LR/WEIGHT_DECAY transfer from AdamW) | "original" (Keller Jordan's sqrt(max(1, A/B)); wants LR ~ 0.02)

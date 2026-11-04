@@ -183,3 +183,98 @@ layer (l=29 of 32, ω=3). Training-free, prefill only.
   it may move or widen.
 - **CTC blank handling:** drop blanks entirely, or average runs of them? Dropping them can lose
   boundary and prosody information.
+
+## Novelty search 2026-11-04 (encoder-free analysis, learned in-LLM merging, cross-language rate)
+
+The search was run in three parallel Gemini 3.8 Flash threads, plus my own web searches. Every arXiv id below was
+checked against the arXiv API: the title and date match. ✅ marks claims I also read in the paper's HTML.
+Unmarked numbers come from the Gemini pass.
+
+### Encoder-free speech LLMs and their layer-wise analysis
+
+- **Encoder-Free Multimodal LLMs Learn Implicit Encoders** ✅ [2610.24239](https://arxiv.org/abs/2610.24239)
+  (Harwath, Raj, Livescu, Khudanpur et al.; arXiv Oct 16 2026, submitted to ICLR 2027).
+  - Models: Gemma-4 12B (raw 16 kHz waveform in 40 ms windows, i.e. 25 tokens/s, through a linear layer) and
+    Inkling-Small (dMel input).
+  - Early layers act as "implicit encoders" that are invariant to cross-modal context; for Gemma this lasts to
+    about layer 12 of 48.
+  - PWCCA probing on Gemma-4 12B: phonetic information peaks at layer 8 and lexical information at layer 9.
+  - **The paper has no token redundancy, merging, pruning, or rate analysis, and no multilingual analysis**
+    (audio is English only). Its future work is about distilling pretrained encoders into the early layers.
+  - **This title is our proposed framing ("encoder-free LLMs learn their own encoder"), so that framing is
+    taken.** Our work has to build on it: where does the implicit encoder become compressible, and can we merge
+    there?
+- **Teaching LLMs to Hear Who Spoke What (MSP)** [2610.01695](https://arxiv.org/abs/2610.01695) (Shi, Fan,
+  Sivasankaran, Deng, Li; Oct 2026). Encoder-free mel → LLM at a fixed 12.5 Hz, with metadata-supervised
+  pretraining for speaker and paralinguistic tasks. No layer analysis and no adaptive rate.
+- **Mel-LLM** [2606.10231](https://arxiv.org/abs/2606.10231): already covered above. Its only layer analysis is
+  a coarse LoRA-freezing ablation.
+- **Gemma-4 12B is open-weight (Apache 2.0) and encoder-free for audio.** The HF transformers docs describe it as
+  `gemma4_unified`, with an RMSNorm → Linear audio input. It could serve as a strong encoder-free model for
+  training-free analysis. It needs about 24 GB in bf16, but our GPU has 16 GB, so it would have to be quantised.
+  I have not checked its ASR quality.
+
+### Layer-wise redundancy in encoder-based speech LLMs (background)
+
+- **Measuring the Redundancy of Decoder Layers in SpeechLLMs** [2603.05121](https://arxiv.org/abs/2603.05121):
+  decoder-layer redundancy is inherited from the text LLM, and 7–8B models keep their ASR quality with 60% of
+  layers. This is layer pruning, not token pruning.
+- **Speech Block Influence** [2609.29343](https://arxiv.org/abs/2609.29343): layer-importance scores for pruning
+  speech LLMs.
+- **ALAS** [2505.19937](https://arxiv.org/abs/2505.19937): per-layer cosine similarity between audio and text
+  representations.
+
+### Token reduction inside the LLM (all training-free) vs learned variable rate (all before the LLM)
+
+| Paper | Learned rate? | Where | Encoder |
+|---|---|---|---|
+| FastAdaSP [2410.03007](https://arxiv.org/abs/2410.03007) (EMNLP 2024 Industry) | No (weighted merging by similarity) | Inside LLM layers | WavLLM / Qwen-Audio |
+| AudioTETRIS [2610.13600](https://arxiv.org/abs/2610.13600) (Oct 2026) | No (keeps tokens at acoustic transitions) | Inside LLM, progressive | Qwen2-Audio, Phi-4-MM |
+| Triage [2609.38878](https://arxiv.org/abs/2609.38878) (Sep 2026) | No (closed-form linear attention predictor) | Before LLM / layer 2 | Encoder-based LALMs |
+| Affinity Pooling [2604.06871](https://arxiv.org/abs/2604.06871) | No | Input + deep layer | Qwen2-Audio, Kimi-Audio |
+| ACIF [2609.18516](https://arxiv.org/abs/2609.18516) (WMT 2026) | CIF with DTW-aligned target length | Connector before LLM | Not stated in abstract |
+| CIF-PT [2305.17499](https://arxiv.org/abs/2305.17499) (ACL Findings 2023) | CIF + quantity loss | Connector | Encoder |
+| MoE + CIF multilingual LLM-ASR [2606.10439](https://arxiv.org/abs/2606.10439) (Jun 2026) | CIF | Connector | Whisper; 11 languages incl. vi |
+| Audio token compression in LALMs [2511.20973](https://arxiv.org/abs/2511.20973) | Unsupervised segmentation / pooling | Before LLM | Whisper |
+| Sylber 2.0 [2601.22306](https://arxiv.org/abs/2601.22306), SyllableLM [2410.04029](https://arxiv.org/abs/2410.04029) | Learned syllable segmentation | Tokenizer | SSL |
+| H-Net [2507.07955](https://arxiv.org/abs/2507.07955) | Learned dynamic chunking with a ratio loss | Inside a hierarchical backbone | Text/bytes (no speech LLM) |
+
+Neither Gemini nor I found:
+- a learned (loss-trained) merging module **inside the layers** of a speech LLM;
+- **any** adaptive or variable-rate merging in an **encoder-free** speech LLM.
+
+The closest pieces are:
+- H-Net, for a learned chunker inside the backbone;
+- Paraformer [2206.08326](https://arxiv.org/abs/2206.08326), which places a CIF predictor between acoustic and
+  decoder blocks, but is not an LLM.
+
+### Cross-language token rate
+
+- **ToMe for multilingual Whisper** ✅ [2609.13151](https://arxiv.org/abs/2609.13151): adjacent-key similarity
+  profiles "cluster tightly across languages (cross-language standard deviation ≤0.03 at every layer)".
+  - Vietnamese changes little (|ΔWER| < 0.5 pp at TRR 0.40).
+  - The schedule is static. A learned per-clip rate is named as future work.
+  - This finding is a counterpoint: an encoder trained on many languages shows *similar* redundancy across
+    languages.
+- MoE + CIF [2606.10439](https://arxiv.org/abs/2606.10439) trains CIF on en and vi but reports no
+  per-language rate.
+- Linguistics grounding: Coupé et al. 2019, *Sci. Adv.* ([doi](https://www.science.org/doi/10.1126/sciadv.aaw2594)).
+  - Languages trade syllable rate against information per syllable, and end up at a similar information rate
+    of about 39 bits/s.
+  - Gemini's numbers, not verified: vi 5.30 syl/s at 8.02 bits/syl; en 6.34 syl/s at 7.08 bits/syl.
+  - Pellegrino et al. 2011, *Language* ([doi](https://doi.org/10.1353/lan.2011.0057)).
+- No published comparison of *learned* compression rates between languages was found.
+
+### Consequences for the paper
+
+1. Drop "encoder-free LLMs learn their own encoder" as the headline. Cite 2610.24239 and build on it: the
+   implicit encoder tells us *where* to compress.
+2. The open method gap is a **learned (CIF / boundary-predictor) merge inside the LLM, placed at the end of the
+   implicit encoder, in an encoder-free model**. Every in-LLM speech merge so far is training-free, and every
+   learned-rate speech method sits before the LLM.
+3. Our analysis contribution is narrower than before: adjacent-token **redundancy and compressibility across
+   depth** in encoder-free models. Harwath et al. measure representational content, not redundancy.
+4. Cross-language: test whether a learned rate tracks syllables (vi has fewer syllables/s) or information rate.
+   Whisper-ToMe's "same redundancy across languages" result is the null hypothesis to beat.
+5. The field is moving fast: 2610.24239, AudioTETRIS, and Triage all appeared in Sep–Oct 2026. Re-run this
+   search before submission.
