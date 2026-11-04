@@ -1,5 +1,10 @@
 # Vietnamese datasets (survey, 2026-10-29; pipeline wired 2026-10-30)
 
+**2026-10-31 storage policy:** further dataset downloads are paused. The total `data/` cap is its
+current footprint (~709 GiB); improve quality through replacements within that cap. Stage 1 source
+and extracted directories already exist; validate their manifests before training. The download commands
+below document setup and should not be rerun as the next step under the current policy.
+
 This survey asks whether we can fine-tune the log-mel → projector → LLM model to understand Vietnamese, and which data
 we would use. **Pipeline support (`--lang vi`, `audiollm/vietnamese.py`, `download_corpora.py --vi_stage1`,
 `unpack_parquet_asr_corpora.py`, `benchmark.py --sets vi`) is wired up; see [Section 7](#7-suggested-plan) for commands.**
@@ -220,49 +225,34 @@ Pipeline code is wired up and verified on CPU (`audiollm/vietnamese.py`, `--lang
 `Qwen/Qwen3-0.6B-Base` and `google/gemma-3-270m`, `download_corpora.py --vi_stage1`, `unpack_parquet_asr_corpora.py`,
 `benchmark.py --sets vi`).
 
+**2026-10-31 readiness:** GPU training/validation and saved-model benchmark smoke tests passed for both backbones.
+The existing source mix measures **708.29 usable hours**, including **421.38 h** in the misleadingly named
+`phoaudiobook_200h/train`. A seeded manifest view now selects **500.00 h / 206,977 utterances** without copying audio.
+Use the prepared configs below, which pin E2 projector/MVN initialization and match utterance exposure across
+tokenizers. Full A/B launched on 2026-10-31 with LFM first and Qwen queued automatically afterward.
+See [readiness and runtime details](VI_STAGE1_READINESS.md).
+
 ```bash
-# 1. Download Stage 1 Vietnamese corpora + eval sets (~67.6 GB raw parquet) & unpack to 16 kHz FLAC
-python download_corpora.py --vi_stage1
-python unpack_parquet_asr_corpora.py --workers 2 \
-    gigaspeech2_vi/validation gigaspeech2_vi/test \
-    fleurs_vi/train fleurs_vi/validation fleurs_vi/test \
-    vlsp2020_100h/train lsvsc/train lsvsc/validation lsvsc/test \
-    vimd/train vimd/validation vimd/test fpt_fosd/train \
-    phoaudiobook_200h/train phoaudiobook_200h/validation phoaudiobook_200h/test
-
-# 2a. Backbone A/B arm 1: LFM2.5-230M-Base (byte fallback; warm-start projector+LoRA or projector-only from D/E2, higher token cap)
-python train.py --lang vi --model LiquidAI/LFM2.5-230M-Base \
-    --init_proj_from runs/latest_model --projector conv --stack 8 \
-    --train_split "phoaudiobook_200h/train+vlsp2020_100h/train+lsvsc/train+vimd/train+fpt_fosd/train" \
-    --val_split "gigaspeech2_vi/validation,fleurs_vi/validation,vimd/validation,lsvsc/validation" \
-    --test_splits --benchmark_sets vi --max_tokens_per_sec 16 \
-    --batch_tokens 4096 --grad_accum 8 --precision amp --lr 2e-4 --proj_lr_mult 2.5 \
-    --warmup_steps 500 --min_lr_ratio 0.1 --train_steps 19200 --eval_every 1000 --checkpoint_every 1000
-
-# 2b. Backbone A/B arm 2: Qwen/Qwen3-0.6B-Base (native vi vocab 1.17 tok/word; hidden_size=1024 -> reuses 1024-d ConvAudioProjector!)
-python train.py --lang vi --model Qwen/Qwen3-0.6B-Base \
-    --init_proj_from runs/latest_model --projector conv --stack 8 \
-    --train_split "phoaudiobook_200h/train+vlsp2020_100h/train+lsvsc/train+vimd/train+fpt_fosd/train" \
-    --val_split "gigaspeech2_vi/validation,fleurs_vi/validation,vimd/validation,lsvsc/validation" \
-    --test_splits --benchmark_sets vi --max_tokens_per_sec 8 \
-    --batch_tokens 4096 --grad_accum 8 --precision amp --lr 2e-4 --proj_lr_mult 2.5 \
-    --warmup_steps 500 --min_lr_ratio 0.1 --train_steps 19200 --eval_every 1000 --checkpoint_every 1000
-
-# 3. Benchmark & compare against PhoWhisper / Whisper baselines
-python benchmark.py hf:vinai/PhoWhisper-small --sets vi
-python benchmark.py --table --sets vi
+# Manual reproduction commands; the persistent queue is already running. Avoid duplicate launches.
+export HF_HUB_OFFLINE=1 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false
+.venv/bin/python train.py --config configs/vi_stage1_lfm.json
+.venv/bin/python train.py --config configs/vi_stage1_qwen.json
 ```
 
+The earlier setup sketch has been replaced by these configs. Downloading and unpacking are already complete;
+further downloads remain paused under the storage cap. Training automatically runs the Vietnamese benchmark.
+Use `.venv/bin/python benchmark.py --table --sets vi` to inspect completed results.
+
 1. **Choose the backbone first.** Run the same Stage 1 experiment twice: once on `LiquidAI/LFM2.5-230M-Base` (byte
-   fallback, `--max_tokens_per_sec 16`) and once on `Qwen/Qwen3-0.6B-Base` (1.17–1.42 tok/word, `hidden_size=1024` so
+   fallback, `--max_tokens_per_sec 32`) and once on `Qwen/Qwen3-0.6B-Base` (`--max_tokens_per_sec 12`, 1.17–1.42 tok/word, `hidden_size=1024` so
    `--init_proj_from` directly transfers the English-aligned 12.5 Hz `ConvAudioProjector`).
-2. **Stage 1 data (~500 h, labels A/S, all downloadable via `--vi_stage1`, ~68 GB raw):**
-   - `phoaudiobook_200h` (~186 h slice, 16 kHz; full 1,494 h `phoaudiobook` also in `download_corpora.py`);
-   - `vlsp2020_100h` (~100 h);
-   - `lsvsc` (~100 h);
-   - `vimd` (~81 h train, resampled from 44.1/48 kHz to 16 kHz, NC-ND);
-   - `fpt_fosd` (~26 h, MP3 decoded to 16 kHz FLAC).
-3. **Stage 2 (thousands of hours, label C):**
+2. **Prepared Stage 1 data (500.00 h, labels A/S, measured after [1,30] s filtering):**
+   - `phoaudiobook_200h` (seeded **213.09 h** selection from 421.38 h already extracted, 16 kHz);
+   - `vlsp2020_100h` (98.51 h);
+   - `lsvsc` (80.60 h);
+   - `vimd` (77.65 h, resampled from 44.1/48 kHz to 16 kHz, NC-ND);
+   - `fpt_fosd` (30.15 h, MP3 decoded to 16 kHz FLAC).
+3. **Stage 2 (deferred; any acquisition requires quality replacements within the current storage cap):**
    - Full `phoaudiobook` (1,494 h);
    - GigaSpeech 2 vi refined, after the gate (~824 GB, stream or take a subset);
    - LEMAS vi, after an audit;

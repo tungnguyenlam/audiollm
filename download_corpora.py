@@ -48,7 +48,8 @@ REGISTRY = {
     "lsvsc": ("doof-ferb/LSVSC", ["data/*"], "data/corpora/lsvsc", 12.0, "asr_vi"),
     "vimd": ("nguyendv02/ViMD_Dataset", ["data/*"], "data/corpora/vimd", 16.0, "asr_vi"),
     "fpt_fosd": ("doof-ferb/fpt_fosd", ["data/*"], "data/corpora/fpt_fosd", 2.6, "asr_vi"),
-    # Stage 1 (~186 h slice = first 100/803 train shards + full val/test) vs full 1,494 h PhoAudiobook
+    # First 100 train shards + full val/test; measured 421 h train locally on 2026-10-31.
+    # Shard count is not a duration guarantee. Use the audited 500 h manifest view for Stage 1.
     "phoaudiobook_200h": ("thivux/phoaudiobook", ["data/train-000*.parquet", "data/validation-*", "data/test-*"], "data/corpora/phoaudiobook_200h", 21.0, "asr_vi"),
     "phoaudiobook": ("thivux/phoaudiobook", ["data/*"], "data/corpora/phoaudiobook", 167.0, "asr_vi"),
 }

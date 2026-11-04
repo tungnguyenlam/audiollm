@@ -9,8 +9,11 @@ log-mel → `Linear` projector → LFM2.5 model. For each dataset it gives:
 - a citation (BibTeX is at the end of the doc).
 
 `download_corpora.py` fetches the corpora (`--list` shows what's there; `--only a,b` fetches particular ones).
-`prepare_data.py` unpacks the LibriSpeech splits. `data/` is capped at about **100 GB**, so only the high-quality
-corpora are downloaded by default. Everything else is in the registry but switched off.
+`prepare_data.py` unpacks the LibriSpeech splits. As of 2026-10-31, `data/` is capped at its current
+footprint of approximately **709 GiB**, including source downloads, extracted audio, and evaluation data.
+Further dataset acquisition is paused. Replace lower-quality data with higher-quality data within this cap;
+free space before downloading replacements and preserve evaluation sets. This is an operational policy,
+not a limit enforced by the downloader.
 
 > [!IMPORTANT]
 > `train.py` still trains on LibriSpeech `train-clean-100` only. The other corpora are on disk, but no data loader
@@ -332,7 +335,7 @@ they're for evaluation only.
 
 ## 6. What's on disk
 
-`download_corpora.py` (default set ≈ 58 GB, with `data/` kept ≤ 100 GB in total):
+Historical default download set (`download_corpora.py`, ≈ 58 GB; this table is not the current disk inventory):
 
 | corpus | source repo | ~GB | role |
 |---|---|---|---|
