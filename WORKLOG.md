@@ -136,7 +136,7 @@ and the table are in `docs/literature_review.md` ("Novelty search 2026-11-04").
   - Gate 0: LoRA (132/132 tensors) and Conv projector loaded with 0 missing/unexpected keys. MVN parameters identical.
   - Gate 1: Verified step-1 full 8-dev-set reproduction against E2 step-19200 within $\pm 0.3\%$ WER (dev-clean 21.13% vs 21.49%, dev-other 34.58% vs 34.99%, AMI 41.25% vs 41.48%, Fleurs 67.26% vs 67.35%, VoxPopuli 37.70% vs 37.18%, Tedlium 29.24% vs 30.19%, GigaSpeech 48.89% vs 49.04%, SPGISpeech 37.53% vs 37.06%).
   - Gate 2: Tuned `--eval_batch_size 16` avoiding allocator warnings; memory steady at peak 6.7 GB.
-- Execution: Launched Stage A run `runs/20261105-101022_mix3200h_conv_stack8_stageA_55k` (55,732 steps, ~10 h wallclock, ~400x realtime).
-  - Checkpointed step 1000 cleanly to disk (`checkpoint/proj.pt`, `lora/`, `trainer_state.pt`).
-  - Daemonized via double-fork with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (PID 476347), ensuring long-term execution decoupled from tool session timeouts.
-  - Active throughput: ~0.50–0.55 s/step (394–414x realtime), peak VRAM 6.9 GB, dev eval every 2,000 steps, checkpoint every 1,000 steps.
+- Execution: Active Stage A run `runs/20261105-111014_mix3200h_conv_stack8_stageA_55k` (55,732 steps, ~8.2 h wallclock, ~400x realtime).
+  - Predecessor run (`20261105-101022`) reached step 4,240 before being killed when the transient T3 ACP systemd scope (`t3code-acp-*.scope`) was recycled at 10:53.
+  - Active run launched in user terminal session (`session-16.scope`, PID 503131 on pts/13), immune to agent scope teardowns.
+  - Active throughput: ~0.50–0.52 s/step (~400x realtime), peak VRAM 6.7 GB, dev eval every 2,000 steps, checkpoint every 1,000 steps.
