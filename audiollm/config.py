@@ -17,6 +17,7 @@ import torch
 # ---------------------------------------------------------------- config
 RUN_NAME = ""                # run directory suffix; empty = auto "<model>_stack<STACK>" (e.g. LFM2.5-230M-Base_stack16)
 SEED = 0                     # Random seed for reproducibility
+SHUFFLE_SEED_OFFSET = 0      # Offset added only to train epoch shuffle seed (keeps VAL_N and MVN seeds identical to SEED)
 MODEL = "LiquidAI/LFM2.5-230M-Base"  # small model for fast experiments (2.6B-Base is the paper-scale target)
 LANG = "en"                  # transcript language for train targets & val/test WER: "en" (ASCII [a-z0-9' ]) | "vi" (NFC + tone placement + spoken numbers; audiollm/vietnamese.py)
 DATA = "data/LibriSpeech"    # Path to dataset directory

@@ -82,39 +82,48 @@
 python train.py \
   --config runs/20261030-153841_mix3200h_giga_spgi_conv_stack8_cont4_19k/config.json \
   --init_from runs/20261030-153841_mix3200h_giga_spgi_conv_stack8_cont4_19k \
-  --seed 1 \
-  --train_steps 38400 \
-  --warmup_steps 500 \
+  --shuffle_seed_offset 1000 \
+  --train_steps 55732 \
+  --warmup_steps 1000 \
   --lr 1e-4 \
   --min_lr_ratio 0.1 \
+  --eval_audio_ablations "" \
+  --eval_every 2000 \
   --checkpoint_every 1000 \
   --eval_batch_size 16 \
-  --eval_every 1000 \
-  --run_name mix3200h_conv_stack8_cont5_converge38k \
-  --notes "E2 continuation to ~1.03 epochs of 3180h English mix (convergence run)"
+  --run_name mix3200h_conv_stack8_stageA_55k \
+  --notes "Stage A convergence: 1 full epoch (55,732 steps) on 3180h English mix with fresh shuffle seed offset 1000"
 ```
 
 ---
 
-## 4. Verification Gates & Execution Protocol
+## 4. Verification Gates & Status
+- **Gate 0 (Weight & Architecture Identity):** **PASSED.** LoRA (132/132 tensors) and Conv projector loaded with 0 missing/unexpected keys. MVN parameters identical.
+- **Gate 1 (E2 Step-1 Reproduction across 8 Dev Sets):** **PASSED.**
+  - Evaluated on step 1 with full `VAL_N=200`:
+    - `dev-clean`: 21.13% (E2: 21.49%)
+    - `validation_ami_ihm`: 41.25% (E2: 41.48%)
+    - `validation_fleurs_en`: 67.26% (E2: 67.35%)
+    - `dev-other`: 34.58% (E2: 34.99%)
+    - `validation_voxpopuli_en`: 37.70% (E2: 37.18%)
+    - `validation_tedlium3`: 29.24% (E2: 30.19%)
+    - `validation_gigaspeech_m`: 48.89% (E2: 49.04%)
+    - `validation_spgispeech_s`: 37.53% (E2: 37.06%)
+  - Dev mean: 39.70% (vs E2 39.85%), reproducing baseline within $\pm 0.3\%$.
+- **Gate 2 (Hardware Stability):** **PASSED.** Peak VRAM $\le 6.7$ GB, training throughput $\approx 0.54$ s/step (350x realtime), zero memory warnings with `EVAL_BATCH_SIZE=16`.
 
-### Pre-Flight Verification Gates (Before launching full 38.4k steps)
-- **Gate 0 (Weight & State Continuity):**
-  - Verify that loading `--init_from` successfully loads both `proj.pt` and `lora/` without key mismatches or missing layers.
-- **Gate 1 (Zero-Step Loss / Gradient Equivalence):**
-  - Run a 10-step smoke test (`--max_steps 10 --eval_every 5 --val_n 10`) to confirm that initial loss falls in the range $[0.50, 0.70]$ (matching the tail loss of E2 $\approx 0.58$) and gradients are finite and non-zero.
-- **Gate 2 (VRAM & Speed Stability):**
-  - Confirm memory consumption remains stable at $\le 7.5\text{ GB}$ (within the 16 GB hardware limit) and step speed is $\le 0.70\text{ s/step}$.
-
-### Monitoring & Milestones
-- Track the 8-split dev mean WER at each 1,000-step interval.
-- **Target Milestones:**
-  - Dev-clean WER: Drop from 20.61% to $< 17.0\%$.
-  - Dev-other WER: Drop from 34.99% to $< 30.0\%$.
-  - 8-split Dev Mean WER: Drop from 39.85% to $< 34.0\%$.
-  - 7-set Open ASR Leaderboard Mean: Drop from 41.36% to $< 36.0\%$.
+### Monitoring & Milestones (Goals, not early stop gates)
+- Track 8-split dev mean WER at each 2,000-step eval.
+- Complete full cosine annealing cycle to step 55,732.
+- Evaluate full 7-set benchmark test suite at completion.
+- If Stage A improves benchmark mean by $\ge 1.0$ point absolute, trigger Stage B (second epoch with peak LR 5e-5).
 
 ---
 
 ## 5. Review History
-- **2026-11-05:** Reviewed and approved by Claude Opus 5.5 (`claude-opus-5-5`). All recommendations (seed offset for uniform sampling across pool, explicit command, Gate 1 loss range definition) incorporated.
+- **2026-11-05:** Reviewed and approved by Claude Opus 5.5 (`claude-opus-5-5`). All blocking and non-blocking recommendations incorporated:
+  - Added `SHUFFLE_SEED_OFFSET` to preserve `SEED=0` for dev sampling and MVN while creating a fresh data order.
+  - Set budget to 1 full epoch (55,732 steps) with 1,000 warmup steps.
+  - Removed premature early stopping in favor of stage-level decision on benchmark test sets.
+  - Replaced noisy Gate 1 with step-1 8-split reproduction test (passed).
+  - Disabled redundant `shuffle` audio ablation to save ~2 hours of evaluation time.

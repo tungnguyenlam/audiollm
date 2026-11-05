@@ -58,10 +58,11 @@ def build_lr_scheduler(optimizer, total_optimizer_steps):
 
 def make_epoch_sampler(train_items, sequence_lengths, epoch):
     """Batches (lists of item indices) for one epoch: fixed BATCH_SIZE, or BATCH_TOKENS padded positions."""
+    seed = C.SEED + C.SHUFFLE_SEED_OFFSET + epoch
     if C.BATCH_TOKENS:
         return create_token_batched_sampler(train_items, sequence_lengths, C.BATCH_TOKENS,
-                                            chunk_size=C.BATCH_SIZE * 50, seed=C.SEED + epoch)
-    return create_length_batched_sampler(train_items, C.BATCH_SIZE, seed=C.SEED + epoch)
+                                            chunk_size=C.BATCH_SIZE * 50, seed=seed)
+    return create_length_batched_sampler(train_items, C.BATCH_SIZE, seed=seed)
 
 
 def estimate_sequence_lengths(train_items, model, frame_rate):
