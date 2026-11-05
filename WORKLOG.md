@@ -104,3 +104,29 @@ and the table are in `docs/literature_review.md` ("Novelty search 2026-11-04").
   changed by it.
 - Next step: training-free merge after LLM layer 4/6/8 in E2, against `uniform_matched`, to locate where the
   learned merge should go. Details: `docs/adaptive_merging_plan.md` ("Next step").
+
+## 2026-11-05 - In-LLM Training-Free Token Merging: implementation, verification gates, and sweep
+- Authored formal specification `docs/in_llm_merging_plan.md` for training-free intermediate layer merging inside LFM2.5-230M. Iteratively reviewed and approved by Claude Opus 5.5 ("Verdict: approved for execution").
+- Implemented exact no-cache greedy decoding engine in `audiollm/layer_merging.py` (`greedy_decode_with_layer_merge`), supporting layer range splitting $[0, k) \to \text{merge} \to [k, 14)$ with causal/conv mask reconstruction, position ID recalculation, and RoPE offset updates.
+- All 4 verification gates passed (`results/merge_in_llm_20261105/verify_gates.py`):
+  - Gate 0 (fp32 split/rebuild identity): 100.0% match across $k \in \{2, 4, 6, 8, 10\}$ (16/16 utterances).
+  - Gate 3 (fp32 batch invariance under merging): 100.0% match between bs=1 and bs=16 at $k=4$.
+  - Gate 1 (bf16 unmerged dev mean WER): 39.87% (target $39.85 \pm 0.15\%$).
+  - Gate 2 (bf16 Phase 0 reproduction at $k=0, \tau=0.70$): 39.76% (target $39.77 \pm 0.15\%$).
+- Disjoint calibration completed on 512 held-out utterances (`results/merge_in_llm_20261105/calibration.json`). All target effective token ratios $E \in \{0.93, 0.87, 0.80, 0.75\}$ match within $|R_{calib} - R_{target}| \le 0.01$.
+- Floor controls evaluated: $R=0$ (`all_dropped`) collapses WER to 97.9–102.2% across all $k \in \{2, 4, 6, 8, 10\}$, confirming strong reliance on intermediate audio representations.
+- Full sweep completed (54 runs across $k \in \{0, 2, 4, 6, 8, 10\}$ and $E \in \{0.93, 0.87, 0.80, 0.75\}$; `results/merge_in_llm_20261105/results.jsonl`, `summary.md`, `report.md`):
+  - In-LLM merge at Layer $k=2$ (post-conv) is the global optimum at $E=0.93$: 39.35% dev mean WER (-0.33% vs baseline 39.68%, -0.21% vs projector $k=0$ 39.56%). On `dev-clean`, $k=2$ drops WER by -1.26% (20.28% vs 21.54%).
+  - Identical attention KV savings: because all 6 self-attention layers are at layers 2, 4, 6, 8, 10, 12, merging at $k=2$ reduces KV cache across all attention layers, matching $k=0$.
+  - Acoustic affinity outclasses uniform decimation across all operating points (WER gap up to -11.58%).
+  - At aggressive compression ($E \le 0.80$), input-level merging ($k=0$) is superior because downstream sequence starvation ($R_k = \frac{14E-k}{14-k}$) hits deeper layers severely ($k=6 \to 57.64\%, k=8 \to 86.13\%, k=10 \to 100.46\%$).
+
+
+
+## 2026-11-05 - Model Convergence Training Plan & Execution
+- User request: Train model to convergence on current dataset first, as error rate is too high (~40% dev mean WER) before doing further experiments.
+- Baseline audit: English E2 baseline (`runs/20261030-153841_mix3200h_giga_spgi_conv_stack8_cont4_19k`) was severely under-trained: only 19,200 steps (epoch 0.3528), leaving 64.7% (~2,060 h / 1.17M utts) of the 3,180 h multi-corpus dataset completely unseen. Train loss was still actively descending ($0.83 \to 0.57$) when the cosine schedule annealed to the floor. In contrast, Vietnamese 500 h already finished 2.97 epochs and plateaued.
+- Authored formal specification `docs/model_convergence_training_plan.md` detailing continuation budget (38,400 steps, cumulative 57,600 steps $\approx 1.03$ epochs of the 3,180 h pool), LR schedule (1e-4 peak, 500-step warmup, cosine to 1e-5), and 3 verification gates.
+- Reviewer Claude Opus 5.5 (`claude -p`) verified and approved the plan ("APPROVED WITH MINOR FIXES"), recommending seed offset (`--seed 1`) for uniform data pool sampling and defining Gate 1 finite loss bounds. All suggestions incorporated.
+- Verification gates validated via 10-step smoke test (`converge38k_smoke10`): Gate 0 (132/132 LoRA + projector weights loaded cleanly), Gate 1 (step 5 loss 0.396, step 10 loss 0.557, finite grad norms 1.7–2.9), Gate 2 (tuned `--eval_batch_size 16` to maintain VRAM $< 7.0$ GB). Smoke run artifacts pruned.
+- Full 38,400-step convergence run launched: `runs/20261105-100647_mix3200h_conv_stack8_cont5_converge38k`.
