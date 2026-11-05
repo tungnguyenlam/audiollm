@@ -21,8 +21,18 @@ grep -n -i 'projector' WORKLOG.md docs/worklog_archive/*.md | tail   # older his
 - At the start of a new month, move the previous month's entries to
   `docs/worklog_archive/YYYY-MM.md`.
 
+## Long-running jobs
+
+- Always fire training and long benchmark runs inside a detached `tmux` session, e.g.:
+  ```bash
+  tmux new-session -d -s <session_name> 'source .venv/bin/activate && python train.py ...'
+  ```
+- **Rationale:** Agent tool processes run inside transient systemd cgroup scopes (`t3code-acp-*.scope`). Backgrounding/double-forking directly inside the agent shell will be killed whenever the agent scope is recycled. A tmux session attached to the user's systemd session persists independently.
+
 ## Repository
 
 Encoder-free Mel -> LLM ASR baseline: CLI scripts `train.py`, `benchmark.py`, `runs.py` over the `audiollm/` package
 (config, data, features, projectors, backbone, model, trainer). See `README.md` ("Code layout").
 Runtime artifacts (`data/`, `runs/`, `results/`) are gitignored; never commit them.
+
+
