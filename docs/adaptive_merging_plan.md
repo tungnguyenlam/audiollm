@@ -75,6 +75,32 @@ Gemini's accompanying roadmap is rejected. It proposed a Whisper-large-v3 + Qwen
 - it duplicates arXiv 2606.10439 (Whisper → CIF → Qwen-2.5 7B, 11 languages incl. vi);
 - it does not fit our 16 GB GPU.
 
+## Parked: merge-aware fine-tune with the in-LLM merge (2026-11-05)
+
+Proposal: after Stage A converges, fine-tune with fixed affinity merging after LLM layer 2, the best point in the
+training-free in-LLM sweep. Question: does adaptation recover the WER lost at aggressive keep ratios? This is
+Phase 1 moved from the projector output (k=0) to k=2. It is a stepping stone to Phase 3, not the contribution.
+Fixed merging adapts the representations, but the discrete boundaries get no gradient. Learning them still needs
+CIF-style aggregation or gates with a token-budget loss.
+
+Caveats before reviving:
+- The k=2 result is weak evidence. It is one run at E=0.93 (-0.33 dev mean, 200 utts per set) on the
+  under-trained E2. Redo the training-free k × E sweep on the Stage A checkpoint before choosing k.
+- In LFM2.5-230M, layers 0–1 are conv blocks and attention starts at layer 2. So k=2 saves exactly as much KV as
+  k=0 and is barely "inside" the implicit encoder. A deeper k is the paper's claim, so keep one deeper arm
+  (e.g. k=4 or 6) at mild E.
+- Fine-tune at E ≈ 0.6 and 0.4, where training-free merging fails. E=0.93 has nothing to recover.
+- Required arms (see "Fair comparison"): affinity and `uniform_matched` at the same k and E, plus a no-merge
+  continuation with the same number of steps. Add a k=0 arm. It needs no new code (`MERGE=affinity` already runs
+  in training) and shows whether the in-LLM position matters after adaptation.
+
+Code needed for k>0: `audiollm/layer_merging.py` only supports inference (`@torch.no_grad`, greedy decode). A
+training forward must run layers [0, k), merge only the audio span, rebuild the masks, position ids and label
+alignment, run [k, 14) and compute CE. Reuse its pooling and mask logic, and gate it with the same fp32
+split/rebuild identity check (Gate 0) on the loss instead of tokens.
+
+Revive when Stage A (`runs/20261105-111014_mix3200h_conv_stack8_stageA_55k`) is benchmarked.
+
 ## Next step (as of 2026-11-04)
 
 Training-free merge **inside** E2: merge after LLM layer 4, 6, or 8 instead of at the input. Use Phase 0 keep

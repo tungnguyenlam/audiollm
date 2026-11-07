@@ -140,3 +140,18 @@ and the table are in `docs/literature_review.md` ("Novelty search 2026-11-04").
   - Predecessor run (`20261105-101022`) reached step 4,240 before being killed when the transient T3 ACP systemd scope (`t3code-acp-*.scope`) was recycled at 10:53.
   - Active run launched in user terminal session (`session-16.scope`, PID 503131 on pts/13), immune to agent scope teardowns.
   - Active throughput: ~0.50–0.52 s/step (~400x realtime), peak VRAM 6.7 GB, dev eval every 2,000 steps, checkpoint every 1,000 steps.
+
+## 2026-11-05 - Parked: merge-aware fine-tune with in-LLM merge at layer 2
+- Proposal reviewed: after Stage A, fine-tune with fixed affinity merging after LLM layer 2 to test whether adaptation recovers WER. Then move to a learned merge policy.
+- Verdict: worth doing as Phase 1 of `docs/adaptive_merging_plan.md` at k=2, not as a separate track. Parked until Stage A is benchmarked.
+- Caveats recorded in the plan ("Parked: merge-aware fine-tune with the in-LLM merge"):
+  - the k=2 optimum is one under-trained-E2 run at E=0.93, so re-sweep on Stage A first;
+  - k=2 is only two conv layers past the input, with the same KV saving as k=0;
+  - fine-tune at E ≈ 0.6/0.4 with `uniform_matched`, no-merge and k=0 arms;
+  - k>0 training needs a new grad-enabled split forward, because `layer_merging.py` only supports inference.
+- No code changed.
+
+## 2026-11-06 - Prepared Stage C continuation command
+- User requested a command to launch manually in tmux after Stage B benchmarking finishes; no training launched.
+- Proposed Stage C: initialize from final Stage B weights (`20261105-211932_mix3200h_conv_stack8_stageB_55k`), 55,732 steps, peak LR 2.5e-5, cosine floor ratio 0.1, warmup 1,000, shuffle offset 3000; inherit remaining Stage B settings.
+- Stage B final 8-set dev mean WER 30.31% versus Stage A 32.25%; late Stage B validation fluctuates, so further gains remain uncertain.
