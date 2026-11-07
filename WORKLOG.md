@@ -181,3 +181,13 @@ and the table are in `docs/literature_review.md` ("Novelty search 2026-11-04").
 - Calibration (`results/merge_in_llm_stageC_20261107/calibration.json`) hits every feasible (k, E) target within 0.01 on R.
 - When every audio token is dropped (`all_dropped`), WER is 98.3–101.3% at k=2..8, so decoding still depends on the audio.
 - The sweep keeps running in tmux `merge_stageC`.
+
+## 2026-11-07 - Stage C merge sweep was killed at 09:48; resumed at 22:08
+- It did not finish. At 09:48 the agent's systemd scope was stopped, and the tmux server died with it because it had been
+  started from inside that scope. Only k=0 finished (E 0.93/0.87/0.80/0.75, 14 rows in `results.jsonl`).
+- Partial k=0 results on Stage C (affinity vs uniform_matched, dev mean WER; unmerged baseline 29.23):
+  E=0.93 29.21 vs 34.37, E=0.87 29.48 vs 38.27, E=0.80 32.57 vs 43.66, E=0.75 36.77 vs 48.85.
+  Affinity at E=0.93 is free, at 0.87 it costs +0.25, and the knee is between 0.87 and 0.80.
+- Resumed with `systemd-run --user --scope --unit=merge-stageC-tmux` + tmux `merge_stageC`. The runner skips completed rows.
+  25 (k, E) pairs are left (50 runs), ~2.5-3 h.
+- AGENTS.md "Long-running jobs" now says to launch tmux via `systemd-run --user --scope`.

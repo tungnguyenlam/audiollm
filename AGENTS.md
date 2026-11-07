@@ -23,11 +23,16 @@ grep -n -i 'projector' WORKLOG.md docs/worklog_archive/*.md | tail   # older his
 
 ## Long-running jobs
 
-- Always fire training and long benchmark runs inside a detached `tmux` session, e.g.:
+- Always fire training and long benchmark runs inside a detached `tmux` session, and start it with
+  `systemd-run --user --scope` so the tmux server gets its own scope:
   ```bash
-  tmux new-session -d -s <session_name> 'source .venv/bin/activate && python train.py ...'
+  systemd-run --user --scope --unit=<name> --collect \
+    tmux new-session -d -s <session_name> 'cd <repo> && source .venv/bin/activate && python train.py ...'
   ```
-- **Rationale:** Agent tool processes run inside transient systemd cgroup scopes (`t3code-acp-*.scope`). Backgrounding/double-forking directly inside the agent shell will be killed whenever the agent scope is recycled. A tmux session attached to the user's systemd session persists independently.
+- **Rationale:** agent tool processes run inside transient systemd scopes (`t3code-*.scope`), and the whole
+  scope is killed when the agent session ends. A plain `tmux new-session` run from the agent shell starts the
+  tmux server *inside* that scope, so the job still dies. This killed the Stage C merge sweep on 2026-11-07.
+  Check with `cat /proc/<tmux-server-pid>/cgroup`: it must not show `t3code-*`.
 
 ## Repository
 
