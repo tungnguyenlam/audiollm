@@ -175,3 +175,9 @@ and the table are in `docs/literature_review.md` ("Novelty search 2026-11-04").
   R=(14E-k)/(14-k), falls below 0.2 are skipped (added pairs: k0/k2 at 0.6 and 0.4, k4/k6 at 0.6).
 - Fresh 512-utt disjoint calibration. Sanity check: the `none` baseline should be within about 0.3 of the trainer's 29.12% dev mean.
 - tmux session `merge_stageC`, log `results/merge_in_llm_stageC_20261107/sweep.log`. Expected runtime ~3.5 h.
+
+## 2026-11-07 - Stage C merge sweep: sanity checks pass
+- Unmerged (`none`) dev mean WER on Stage C is 29.23%; the trainer's final dev eval gave 29.12%, so the gap is +0.11, inside the ±0.3 tolerance.
+- Calibration (`results/merge_in_llm_stageC_20261107/calibration.json`) hits every feasible (k, E) target within 0.01 on R.
+- When every audio token is dropped (`all_dropped`), WER is 98.3–101.3% at k=2..8, so decoding still depends on the audio.
+- The sweep keeps running in tmux `merge_stageC`.
