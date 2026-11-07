@@ -155,3 +155,23 @@ and the table are in `docs/literature_review.md` ("Novelty search 2026-11-04").
 - User requested a command to launch manually in tmux after Stage B benchmarking finishes; no training launched.
 - Proposed Stage C: initialize from final Stage B weights (`20261105-211932_mix3200h_conv_stack8_stageB_55k`), 55,732 steps, peak LR 2.5e-5, cosine floor ratio 0.1, warmup 1,000, shuffle offset 3000; inherit remaining Stage B settings.
 - Stage B final 8-set dev mean WER 30.31% versus Stage A 32.25%; late Stage B validation fluctuates, so further gains remain uncertain.
+
+## 2026-11-07 - Stage C result; Stage C becomes the baseline
+- Run `runs/20261106-101155_mix3200h_conv_stack8_stageC_55k` (from Stage B, 55,732 steps, peak LR 2.5e-5) finished and was benchmarked.
+- Final 8-set dev mean WER 29.12% (Stage B 30.31%, Stage A 32.25%).
+- 9-set test mean WER: A 41.85 → B 40.13 → C 39.26. Per set, C vs B: LS-clean 11.87 (12.68), LS-other 32.73 (33.32),
+  VoxPopuli 28.87 (29.80), AMI 35.93 (36.90), Earnings22 53.38 (54.53), GigaSpeech 33.23 (33.89), SPGI 24.07 (25.09),
+  FLEURS 58.51 (59.56), EdAcc 74.76 (75.39).
+- Decision: stop adding epochs. Each epoch gains about half the previous one (-1.7, then -0.9), so a Stage D would give about -0.4
+  for ~8 h. Stage C replaces E2 (`20261030-153841`) as the baseline for all merging work.
+- Next: rerun the training-free in-LLM merge sweep on Stage C, then choose k for the Phase 1 merge-aware fine-tune
+  (`docs/adaptive_merging_plan.md`, "Parked: merge-aware fine-tune").
+
+## 2026-11-07 - Launched training-free in-LLM merge sweep on Stage C
+- `results/merge_in_llm_stageC_20261107/` is a copy of the 2026-11-05 sweep scripts. Checkpoint and output dir now come from
+  `MERGE_RUN_DIR` / `MERGE_OUT_DIR` (defaults: Stage C and this dir). The merge code (`audiollm/layer_merging.py`) is unchanged.
+- Grid: k ∈ {0,2,4,6,8,10} × E ∈ {0.93,0.87,0.80,0.75}, the same as before so results compare directly. Added E=0.60 and 0.40
+  to measure the training-free starting point for the Phase 1 fine-tune. Pairs where the keep ratio after merging,
+  R=(14E-k)/(14-k), falls below 0.2 are skipped (added pairs: k0/k2 at 0.6 and 0.4, k4/k6 at 0.6).
+- Fresh 512-utt disjoint calibration. Sanity check: the `none` baseline should be within about 0.3 of the trainer's 29.12% dev mean.
+- tmux session `merge_stageC`, log `results/merge_in_llm_stageC_20261107/sweep.log`. Expected runtime ~3.5 h.
