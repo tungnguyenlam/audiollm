@@ -219,3 +219,85 @@ and the table are in `docs/literature_review.md` ("Novelty search 2026-11-04").
   + vimd x2; 16x2, 24k steps, lr 2e-4) at ~1.0 s/step, ETA ~7 h. Running in tmux `-L vi_zac -s vi_zac_graft` under systemd scope
   vi-zac-graft2. Log: results/vi_zac_20261108/train.log.
 - Launch gotcha: the login shell is fish, so a tmux command with `source .venv/bin/activate` dies silently. Wrap it in `bash -c`.
+
+## 2026-11-08 - vi_zac_graft completed; continuation assessment
+- Run `20261108-093006_vi_zac_graft_aug_corr` completed 24,000 steps in 5:57:07.
+- Fixed 300-utt ZAC dev ASR best 39.20% WER at 12k; final 41.56%. Correction best 16.33% at 6k; final 23.35%.
+- Final full 864-utt dev: ASR 43.64%, correction 24.37%; 619-utt holdout: ASR 57.37%, correction 34.96%.
+- Assessment: further unchanged training is unsupported by the late validation trend. Recommend full-dev evaluation of earlier
+  checkpoints and untouched Zipformer hypotheses on identical scoring before choosing a targeted follow-up; no training launched.
+- Evidence: run metrics.jsonl, test_results.json, and results/vi_zac_20261108/train.log. Subset and full-dev WER are not interchangeable.
+
+## 2026-11-08 - Early ZAC checkpoint comparison blocked; matched prediction audit
+- Requested full-dev 6k/12k evaluation cannot run: intermediate weights were overwritten by checkpoint rotation; completion deleted checkpoint/. HUB_REPO was empty; local Programming/HF-cache search found final/smoke ZAC adapters only.
+- Run `20261108-093006_vi_zac_graft_aug_corr`: rescored saved outputs with identical Vietnamese normalization, unique IDs, exact coverage, and reference-equality checks against dev manifest.
+- Full dev (864): untouched Zipformer 18.56% WER; final ASR 43.64%, correction 24.37%.
+- Matched subset (300): Zipformer 18.87%; ASR 6k/12k 42.84/39.20%; correction 6k/12k 16.33/19.92%.
+- 6k correction improves the subset by 2.54 points but cannot establish full-dev superiority. No full-dev early-checkpoint winner is claimed.
+- Decision: keep Zipformer baseline; recover external early weights or use a future run retaining checkpoints. No training launched; no training defaults changed.
+- Reproducible scorer and detailed report: [audit](results/vi_zac_checkpoint_audit_20261108/report.md).
+
+## 2026-11-08 - Independent Sol 6.1 medium audit verification
+- PASS for accuracy of the matched-prediction audit and transparency of its missing-weights blocker; original full-dev 6k/12k evaluation remains incomplete.
+- Scorer rerun reproduced all WERs; separately confirmed identical 300-ID early subsets, inspected checkpoint retention, and repeated local weight search.
+- Details: [verification](results/vi_zac_checkpoint_audit_20261108/verification.md). No training, inference, or default changes.
+
+## 2026-11-08 - Public per-run Hugging Face backups and portable quickstart
+- User requested public backups, one repository per training run, with training information/progress in README.
+- Decision: new default HUB_REPO=auto resolves authenticated account/audiollm-<run_id>; custom user/prefix gets the run id suffix; empty disables uploads. Configured backups enable 500-step checkpoints if unset.
+- Replace rotating-only remote mirror with immutable upload snapshots and retained checkpoints/step-N/ including optimizer/scheduler/RNG; keep checkpoint/ after completion and upload final weights before test evaluation.
+- Bundle inference/training source, requirements, MVN and local base/tokenizer; add scripts/hf_backup.py (push/selective pull/revision/resume) and scripts/transcribe.py (audio resampling, CPU/CUDA, correction).
+- Publish root model card with configuration, progress, WER and artifact links at every upload; retry uploads three times and record local hub_status.json instead of falsely reporting final success.
+- Validation so far: three offline integrity/retry/restore tests pass; CLI help and compile checks pass. No training or WER experiment launched.
+
+## 2026-11-08 - Full Vietnamese continuation with rotating 20% English replay
+- User requested continuation on all Vietnamese training data with 20% English cycling through the entire English catalog.
+- Added REPLAY_SPLIT/REPLAY_FRACTION: each epoch covers all primary examples and takes the next seeded English slice,
+  exhausting the catalog before reshuffling. Ratio is by utterance count over each epoch, not audio hours or each batch.
+- English targets use English normalization; English replay bypasses Vietnamese synthetic correction. Existing Vietnamese
+  augmentation/correction stays enabled. No dev/test manifests are added to training; GigaSpeech2 VI has no local train split.
+- Config: configs/vi_full_en20.json; starts from final vi_zac_graft weights (24k), fresh optimizer, LR 5e-5, warmup 1000,
+  shuffle offset 4000. Removed ZAC x10 / ViMD x2 weighting; added FLEURS VI train for full available unweighted VI coverage.
+- Eligible catalog: 277,723 VI + 1,741,670 EN; 69,431 EN examples per VI epoch; 26 epochs / about 282,074 steps to cover EN once.
+- Run: 20261108-162118_vi_full_en20_cycle; tmux -L vi_en20, session vi_en20; systemd vi-en20-cycle-tmux.scope verified outside t3code.
+- Log: results/vi_en_replay_20261108/train.log; counts: results/vi_en_replay_20261108/catalog.json. WER pending.
+- Verification: deterministic replay/coverage across cycle boundary, epoch batching remapping, English normalization and correction
+  exclusion passed; persistent regression tests in tests/test_replay.py. Estimated runtime ~3 days, pending observed throughput.
+- Follow-up decision: enable auto backups in checked-in training presets as well; old saved run configs still honor their explicit setting.
+- Real upload: completed run 20261108-093006_vi_zac_graft_aug_corr backed up publicly to https://huggingface.co/tungnguyenlam/audiollm-20261108-093006_vi_zac_graft_aug_corr at bb6f02f2a0b76d0565e6895873eb84573fe1fb1d; public visibility verified via Hub API. No lost intermediate weights were recovered.
+
+## 2026-11-08 - Training catalog audio-hour audit
+- Manifest durations for vi_full_en20: VI 728.89 h raw / 722.15 h eligible; EN 3197.71 h raw / 3169.36 h eligible (1–30 s).
+- Counts exclude validation/test and do not multiply by replay/epochs. PhoAudiobook directory name says 200h but its train
+  manifest totals 421.38 h; reporting manifest durations rather than directory labels.
+- Detailed per-corpus totals: results/vi_en_replay_20261108/duration_totals.json. No training settings changed.
+- Final validation: four backup tests pass; downloaded final bundle at the pinned Hub commit, verified SHA-256 of adapter/projector/embed/MVN/base/tokenizer, and ran standalone inference from /tmp with exact local transcript agreement. No new WER measurement. Evidence: [report](results/hf_backup_20261108/report.md).
+
+## 2026-11-08 - Restarted English replay continuation with 1.5x microbatch
+- User authorized stopping and continuing with batch size 24 (from 16), GRAD_ACCUM stays 2: effective batch 48 vs 32.
+- Stopped run 20261108-162118_vi_full_en20_cycle with SIGINT at step 314, before its first checkpoint; discarded 4m14s of updates.
+- Restart initializes from the completed 24k Vietnamese run, retaining the full 26-pass replay plan and learning rate 5e-5.
+- configs/vi_full_en20.json now uses RUN_NAME vi_full_en20_cycle_b24, BATCH_SIZE 24, WARMUP_STEPS 667 (similar example exposure).
+- Epoch-derived budget automatically falls from 282074 to about 188058 steps; no sampler cursor/optimizer state is reused across
+  different batch layouts. 80/20 utterance ratio and complete English catalog coverage are preserved.
+- Detached tmux -L vi_en20_b24 / session vi_en20_b24, systemd vi-en20-b24-tmux.scope.
+- Log: results/vi_en_replay_20261108/train_b24.log. Startup/data loading underway; throughput and WER pending.
+- Initial b24 launch 20261108-162654 failed before training: concurrent Hub auto-backup default requested whoami in offline mode.
+  Relaunched with explicit --hub_repo "" to preserve the original local-only job behavior, socket vi_en20_b24_retry,
+  scope vi-en20-b24-retry-tmux; log results/vi_en_replay_20261108/train_b24_retry.log.
+
+## 2026-11-08 - Batch 32 x accum 3 relaunch; precision speed test
+- User asked for BATCH_SIZE 32, GRAD_ACCUM 3 (effective 96, was 48) because the GPU looked underused. Stopped b24 run
+  20261108-162722 at step ~1700 (checkpoint at step 1000 not reused, since the batch layout changed). WARMUP_STEPS 667 -> 333
+  (same number of warmup examples), LR unchanged at 5e-5, RUN_NAME vi_full_en20_cycle_b32a3.
+- Speed test (b32 x a3, 400-step smoke runs killed after 6 perf lines; logs in results/vi_en_replay_20261108/speed/):
+  amp ~2.4 s/step, ~40 utt/s; fp32 (fp32 weights and compute) ~20 s/step, ~4.7 utt/s (~8.5x slower);
+  PRECISION=bf16 crashes at step 0 (bf16 vs fp32 matmul dtype mismatch when initializing from INIT_FROM); amp without
+  GRAD_CKPT OOMs at b32 on 16 GB.
+- Finding: b24 x a2 already ran at ~40 utt/s, so the larger batch does not raise throughput. rocm-smi showed 95% busy;
+  the run was compute-bound, and the unused VRAM did not mean idle compute. Pad efficiency ~74% is the visible slack.
+- Pure bf16 rejected: Adam steps of size ~lr (5e-5, decaying to 5e-6; embeddings 1.25e-5) fall below the bf16 rounding
+  threshold for weights larger than ~0.01 in magnitude. Larger batches lower gradient noise but not the step size, so
+  they do not fix this. amp already runs matmuls in bf16.
+- Relaunched: tmux -L vi_en20_b32a3, scope vi-en20-b32a3-tmux; log results/vi_en_replay_20261108/train_b32a3.log.
+  ~2.45 s/step, ETA ~65-70 h (b24 run: ~60 h).

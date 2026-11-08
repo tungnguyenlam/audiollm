@@ -83,33 +83,51 @@ long ones in small batches.
 
 ## Checkpoints, resume and the Hugging Face Hub (Colab)
 
-`--checkpoint_every N` saves a resumable checkpoint every N optimizer steps to `runs/<id>/checkpoint/`, replacing
-the previous one. It holds LoRA, the projector, the optimizer and LR schedule, the data position and the RNG state.
-`python train.py --resume runs/<id>` continues the run in the same directory with the same config. Losses after a
-resume match an uninterrupted run exactly (tested with a hard kill). The one exception is SpecAugment masks, which
-are drawn in DataLoader workers. `checkpoint/` is deleted once the run finishes.
+New training runs create a **public** Hugging Face model repository automatically, using the logged-in account:
+`<account>/audiollm-<run_id>`. Authenticate once with `hf auth login` (write access).
+Use `--hub_repo team/prefix` for `team/prefix-<run_id>`, or `--hub_repo ""` to disable uploads.
+A configured backup enables `--checkpoint_every 500` when the interval is zero. Existing saved configs retain their
+explicit HUB_REPO setting. Initialization fails early if the account cannot create the destination repo.
 
-`--hub_repo user/name` mirrors `runs/<id>/` to `<repo>/<id>/` in that model repo, which is created private if
-missing. The mirror is pushed after every checkpoint and at the end. Uploads run in the background, and a failed
-upload is logged without stopping training. Since `plots.png`, `metrics.jsonl` and `log.txt` go up too, the repo
-page doubles as a remote monitor. The final push removes `checkpoint/` from the Hub copy.
-`python runs.py pull user/name <run_id>` downloads a run back into `runs/<run_id>/` to resume, evaluate or benchmark.
+Each checkpoint uploads LoRA, projector, optional trained embeddings, MVN normalization, optimizer, LR schedule,
+data position and RNG state. The latest state stays in `checkpoint/`; every uploaded step also stays under
+`checkpoints/step-000006000/`, including after completion. Local checkpoint rotation does not delete remote steps.
+The final adapter and projector live at the run directory root. A local/custom base model and tokenizer are copied
+into `base_model/`; ordinary Hub backbones are fetched from the upstream model named in config.json.
 
-Colab (needs a GPU with bf16, e.g. L4/A100):
+The repository README shows config, step counts, validation/test WER and links to metrics, logs and plots. It updates
+at startup, each checkpoint, after trained weights are saved (before test evaluation), and completion. Each backup
+includes a `quickstart/` source snapshot and requirements. Uploads read an immutable local snapshot in a background
+thread, retry three times, and record success/commit or failure in local `hub_status.json`. Training waits for the
+previous upload at the next backup. Final upload failure is reported and local files remain available for retry.
+Retaining all remote optimizer states costs storage; allow temporary local disk for one upload snapshot plus any
+bundled base model. No training audio is uploaded.
 
 ```bash
-git clone <this repo> audiollm && cd audiollm
-pip install -r requirements.txt causal-conv1d      # torch (CUDA) is preinstalled
-hf auth login                                      # token with write access, for --hub_repo
-./setup_dataset.sh --no-esb --no-corpora           # LibriSpeech to local disk (not Drive: too slow for ~280k small files)
-python train.py --checkpoint_every 500 --hub_repo user/audiollm-runs --model LiquidAI/LFM2.5-1.2B-Base ...
-# new session after a disconnect:
-python runs.py pull user/audiollm-runs <run_id> && python train.py --resume runs/<run_id>
+hf auth login
+python train.py --checkpoint_every 500             # public per-run backups on by default
+# Upload an existing completed/interrupted run, or retry its backup:
+python scripts/hf_backup.py push auto runs/<run_id>
+# Download final weights (use a fresh output directory):
+python scripts/hf_backup.py pull <account>/<repo> <run_id> --output downloads
+python scripts/transcribe.py --run downloads/<run_id> --audio speech.wav
+# Download and test an earlier checkpoint:
+python scripts/hf_backup.py pull <account>/<repo> <run_id> --step 6000 --output earlier
+python scripts/transcribe.py --run earlier/<run_id> --step 6000 --audio speech.wav
+# Resume that step with its optimizer/scheduler/RNG state (training data still required):
+python train.py --resume earlier/<run_id> --hub_repo auto
 ```
 
-Each Hub upload holds LoRA, the projector and AdamW states, which is about 200 MB for the 230M model with r64. Training
-waits for the previous upload before it writes the next checkpoint. Choose `--checkpoint_every` so an upload fits
-in the interval (500 steps is several minutes).
+`--step latest` selects `checkpoint/`. Pull supports `--revision <commit-SHA>` for a specific Hub revision and
+refuses to mix downloads with an existing run directory. Inference accepts mono/stereo audio at any sample rate,
+resamples to the training rate, and needs no training dataset. Add `--device cpu` for float32 CPU inference;
+CUDA uses bfloat16. For correction-capable models, add `--hypothesis "existing ASR text"`.
+Install PyTorch for your platform and `pip install -r requirements.txt` first. The bundled `quickstart/transcribe.py`
+can also run directly from a downloaded Hub repository using `--run <download>/<run_id>`.
+
+`python runs.py pull <repo> <run_id>` remains available to download the entire run, including all retained steps.
+Exact training continuation requires the original datasets/augmentation assets. SpecAugment randomness in workers
+can differ after resume. These custom audio models use the included inference code, rather than an HF ASR pipeline.
 
 ## Run tracking
 

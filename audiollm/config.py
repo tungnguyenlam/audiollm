@@ -23,6 +23,8 @@ LANG = "en"                  # transcript language for train targets & val/test 
 DATA = "data/LibriSpeech"    # Path to dataset directory
 ASR_CORPORA = "data/asr_corpora"  # unpacked non-LibriSpeech corpora (unpack_parquet_asr_corpora.py), addressed as "<corpus>/<split>"
 TRAIN_SPLIT = "train-clean-100+train-clean-360+ami_ihm/train+fleurs_en/train"  # Training split(s), "+"-joined: LibriSpeech names or "<corpus>/<split>" (100+360 h read speech, ~80 h AMI meetings, ~7 h FLEURS); "train-clean-100" = pre-2026-10-27 runs. "<split>*K" repeats a split K times per epoch (fractional K adds a seeded random subset), e.g. "fleurs_en/train*6"
+REPLAY_SPLIT = ""          # English training catalog cycled without replacement across Vietnamese epochs
+REPLAY_FRACTION = 0.2      # Fraction of training utterances from REPLAY_SPLIT
 MVN_SPLIT = ""               # split spec whose cached MVN stats normalise the mel features; "" = TRAIN_SPLIT without "*K" weights (INIT_FROM runs inherit the init run's)
 INIT_FROM = ""               # run dir to initialise LoRA + projector weights from (fresh optimizer, warmup and schedule), e.g. runs/20261027-150147_mix544h_conv_stack8; "" = fresh init
 INIT_PROJ_FROM = ""          # run dir to initialise only the projector from (fresh LoRA), e.g. a 230M run's projector into a 350M run (same hidden size); "" = off
@@ -132,8 +134,8 @@ NO_REPEAT_NGRAM_SIZE = 4     # >0: forbid repeating any n-gram of this size in a
 NUM_WORKERS = 8              # Number of DataLoader worker processes
 LOG_N_EXAMPLES = 2           # Number of (ref, hyp) examples printed after each validation pass
 PLOT_EVERY = 100             # Re-draw runs/<id>/plots.png (+ runs/INDEX.md) every N optimizer steps and after each val
-CHECKPOINT_EVERY = 0         # >0: every N optimizer steps, save a resumable checkpoint (LoRA + projector + optimizer + LR schedule + data position + RNG) to runs/<id>/checkpoint/, replacing the previous one; continue with `train.py --resume runs/<id>`. Deleted once the run finishes
-HUB_REPO = ""                # Hugging Face Hub model repo ("user/name", created private if missing) that runs/<id>/ is mirrored to as <repo>/<id>/ at every checkpoint and at the end; pull it back with `runs.py pull`. "" = off
+CHECKPOINT_EVERY = 0         # >0: every N optimizer steps, save a resumable checkpoint (LoRA + projector + optimizer + LR schedule + data position + RNG) to runs/<id>/checkpoint/, replacing the previous one; continue with `train.py --resume runs/<id>`. Retained after the run finishes
+HUB_REPO = "auto"            # public per-run Hub backup: auto = authenticated account/audiollm-<run_id>; user/prefix = user/prefix-<run_id>; empty = off; enables 500-step checkpoints if unset
 BENCHMARK_SETS = "all"       # After training + test eval, run benchmark.py with the in-memory model: "all" (7 Open ASR sets + local fleurs_en/edacc test sets), "openasr", "vi" (local Vietnamese test sets), comma list (e.g. "librispeech_clean,ami") or "none"
 
 DEVICE = "cuda"              # Compute device (cuda or cpu)
@@ -266,6 +268,9 @@ def parse_args(argv=None):
     base_config_path = pre_args.config or (Path(run_dir, "config.json") if run_dir else None)
     if base_config_path:
         base_config = with_legacy_defaults(json.load(open(base_config_path)))
+        bundled_base = Path(base_config_path).resolve().parent / "base_model"
+        if (bundled_base / "config.json").exists():
+            base_config["MODEL"] = str(bundled_base)
         unknown_keys = [key for key in base_config if key.isupper() and key not in DEFAULT_CONFIG]
         if unknown_keys:
             print(f"warning: ignoring unknown keys from {base_config_path}: {unknown_keys}", file=sys.stderr)

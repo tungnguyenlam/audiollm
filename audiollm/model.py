@@ -39,7 +39,7 @@ class SpeechLLM(nn.Module):
         Fresh LoRA + projector (saved_run_dir=None), or a run's lora/ + proj.pt (trainable=True keeps the loaded
         LoRA trainable, for INIT_FROM). The projector is built before LoRA, so seeded inits match older runs.
         """
-        tokenizer, llm = load_llm()
+        tokenizer, llm = load_llm(saved_run_dir)
         embedding_std = llm.get_input_embeddings().weight.float().std().item()
         projector = build_projector(C.N_MELS, llm.config.hidden_size, embedding_std).to(C.DEVICE, trainable_dtype())
         llm = attach_lora(llm, saved_run_dir, trainable)

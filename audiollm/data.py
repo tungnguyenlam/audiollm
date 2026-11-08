@@ -50,9 +50,9 @@ def load_librispeech_split(split_name):
     return utterance_records
 
 
-def normalize_training_text(text):
+def normalize_training_text(text, lang=None):
     """Training target / reference text: English ASCII [a-z0-9' ], or Vietnamese NFC + spoken numbers (LANG='vi')."""
-    if C.LANG == "vi":
+    if (lang or C.LANG) == "vi":
         return normalize_vi_text(text)
     if text.strip() == "IGNORE_TIME_SEGMENT_IN_SCORING":
         return ""
@@ -61,7 +61,7 @@ def normalize_training_text(text):
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9' ]", " ", text)).strip()
 
 
-def load_split(split_spec):
+def load_split(split_spec, lang=None):
     """
     Utterances for a split spec: a LibriSpeech split name ("train-clean-100"), an unpacked corpus split
     ("ami_ihm/train", see unpack_parquet_asr_corpora.py), or several of them joined with "+". A "*K" suffix
@@ -81,7 +81,7 @@ def load_split(split_spec):
         else:
             split_records = load_librispeech_split(name)
         for record in split_records:
-            record["text"] = normalize_training_text(record["text"])
+            record["text"] = normalize_training_text(record["text"], lang)
         split_records = [record for record in split_records if record["text"]]
         if mode == "corr":
             split_records = [dict(record, mode="correct") for record in split_records if record.get("hyp")]
@@ -119,7 +119,13 @@ def load_validation_items(split_name):
 
 def load_train_items():
     """TRAIN_SPLIT utterances inside [MIN_TRAIN_SEC, MAX_TRAIN_SEC]."""
-    return [item for item in load_split(C.TRAIN_SPLIT) if C.MIN_TRAIN_SEC <= item["sec"] <= C.MAX_TRAIN_SEC]
+    items = load_split(C.TRAIN_SPLIT)
+    if C.REPLAY_SPLIT:
+        if not 0 < C.REPLAY_FRACTION < 1:
+            raise ValueError("REPLAY_FRACTION must be between 0 and 1")
+        replay = load_split(C.REPLAY_SPLIT, lang="en")
+        items += [dict(item, replay=True) for item in replay]
+    return [item for item in items if C.MIN_TRAIN_SEC <= item["sec"] <= C.MAX_TRAIN_SEC]
 
 
 # ---------------------------------------------------------------- dataset
@@ -145,7 +151,7 @@ class SpeechDataset(torch.utils.data.Dataset):
         """Hypothesis text for this utterance's correction prompt, or None for plain transcription."""
         if item.get("mode") == "correct":
             return item["hyp"]
-        if self.noiser is None or random.random() >= C.CORRECTION_P:
+        if item.get("replay") or self.noiser is None or random.random() >= C.CORRECTION_P:
             return None
         if item.get("hyp") and random.random() < C.CORRECTION_REAL_P:
             return item["hyp"]
@@ -197,6 +203,23 @@ def collate_speech_batch(items):
 
 
 # ---------------------------------------------------------------- batching
+def replay_epoch_indices(items, epoch, fraction, seed):
+    """One full primary pass plus a rotating replay slice; exhaust catalog before reshuffling."""
+    primary = [i for i, item in enumerate(items) if not item.get("replay")]
+    replay = [i for i, item in enumerate(items) if item.get("replay")]
+    if not primary or not replay:
+        raise ValueError("Replay mixing requires nonempty primary and replay catalogs")
+    count = round(len(primary) * fraction / (1 - fraction))
+    selected = []
+    start = epoch * count
+    while len(selected) < count:
+        cycle, offset = divmod(start + len(selected), len(replay))
+        order = replay.copy()
+        random.Random(seed + cycle).shuffle(order)
+        selected.extend(order[offset:offset + count - len(selected)])
+    return primary + selected
+
+
 def create_length_batched_sampler(dataset_items, batch_size, seed):
     """
     Bucket utterances by audio duration to minimize padding overhead:

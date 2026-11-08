@@ -22,7 +22,7 @@ Each training run gets its own directory runs/<YYYYmmdd-HHMMSS>_<run_name>/ with
     model_summary.txt  LLM shape, parameter counts per component, projector layers
     log.txt, lora/, proj.pt, mvn.pt (feature normalisation stats), hyp_<test split label>.jsonl (full test hyps), test_results.json
     val_hyps/<dev split label>/step_<N>.jsonl   {id, ref, hyp} of every val utt at each val pass
-    checkpoint/      resumable state while training (CHECKPOINT_EVERY), removed at the end
+    checkpoint/      latest resumable state (CHECKPOINT_EVERY), retained at the end
 Split labels name the dataset (runs.split_label): dev-clean_librispeech, validation_ami_ihm, validation_fleurs_en.
 runs/latest -> the newest run, runs/latest_model -> the newest run with saved weights.
 Compare runs with `python runs.py` (see runs.py --help).
@@ -39,7 +39,6 @@ Compare runs with `python runs.py` (see runs.py --help).
 import json
 import re
 import shlex
-import shutil
 import socket
 import sys
 import time
@@ -64,6 +63,8 @@ def main():
     args, config = C.parse_args()
     if (config["INIT_FROM"] or config["INIT_PROJ_FROM"]) and not (args.eval_only or args.resume):  # a resumed config is already resolved
         config = resolve_init_from(config)
+    if config["HUB_REPO"] and not config["CHECKPOINT_EVERY"]:
+        config["CHECKPOINT_EVERY"] = 500
     C.apply_config(config)
     seed_everything(C.SEED)
 
@@ -135,6 +136,8 @@ def main():
     log_and_print(f"overrides vs defaults: {json.dumps(config['meta']['overrides'])}")
 
     hub = HubSync.from_config(run_dir, log_and_print)
+    if hub:
+        hub.push("started")
     run_start_time = time.time()
     try:
         trained_model, _ = train(args, run_dir, tracker, log_and_print, hub)
@@ -145,14 +148,14 @@ def main():
         log_and_print(f"run {status}: {error!r}")
         runs_lib.refresh_run_views(run_dir, log_and_print)
         if hub:
-            hub.push(f"{status} at step {tracker.summary.get('step')}", final=False)
+            hub.push(f"{status} at step {tracker.summary.get('step')}", final=True)
             hub.wait()
         raise
     tracker.update(status="done", finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
                    duration_sec=round(time.time() - run_start_time))
     if hub:
         hub.wait()  # an upload may still be reading checkpoint/
-    shutil.rmtree(run_dir / "checkpoint", ignore_errors=True)  # final weights are in lora/ + proj.pt
+    # Keep the latest resumable state locally and on the Hub after completion.
     runs_lib.refresh_run_views(run_dir, log_and_print)
 
     # Open ASR benchmark with the model still in memory. The run is already "done": a benchmark error is recorded
@@ -171,8 +174,10 @@ def main():
         runs_lib.refresh_run_views(run_dir, log_and_print)
     if hub:
         hub.push("final", final=True)
-        hub.wait()
-        log_and_print(f"hub: final upload done -> {C.HUB_REPO}/{run_id}")
+        if hub.wait():
+            log_and_print(f"hub: final upload done -> {hub.repo_id}/{run_id}")
+        else:
+            log_and_print("hub: FINAL BACKUP FAILED; local files retained, retry with scripts/hf_backup.py push")
     log_file.close()
 
 

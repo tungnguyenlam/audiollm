@@ -62,7 +62,7 @@
   "LOG_N_EXAMPLES": 2,
   "PLOT_EVERY": 100,
   "CHECKPOINT_EVERY": 1000,
-  "HUB_REPO": "",
+  "HUB_REPO": "auto",
   "BENCHMARK_SETS": "vi",
   "DEVICE": "cuda",
   "PRECISION": "amp",

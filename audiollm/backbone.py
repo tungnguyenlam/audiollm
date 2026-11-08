@@ -1,6 +1,7 @@
 """Backbone: the pretrained causal LLM (MODEL) + its tokenizer, frozen, with a LoRA adapter (LORA_*)."""
 import os
 import re
+from pathlib import Path
 
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -14,11 +15,17 @@ from audiollm.utils import trainable_dtype
 REMOTE_CODE_REVISIONS = {"LiquidAI/LFM3-1.7B-Base": "545fc8f4c7b5fa9f405105274cd29c4f8f44b526"}
 
 
-def load_llm():
+def load_llm(saved_run_dir=None):
     """(tokenizer, base LLM on DEVICE in DTYPE), no adapter yet."""
+    model_path = C.MODEL
+    if saved_run_dir is not None:
+        for parent in (Path(saved_run_dir), *Path(saved_run_dir).parents):
+            if (parent / "base_model" / "config.json").exists():
+                model_path = str(parent / "base_model")
+                break
     remote = {"trust_remote_code": True, "revision": REMOTE_CODE_REVISIONS[C.MODEL]} if C.MODEL in REMOTE_CODE_REVISIONS else {}
-    tokenizer = AutoTokenizer.from_pretrained(C.MODEL, **remote)
-    llm = AutoModelForCausalLM.from_pretrained(C.MODEL, dtype=C.DTYPE, **remote).to(C.DEVICE)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, **remote)
+    llm = AutoModelForCausalLM.from_pretrained(model_path, dtype=C.DTYPE, **remote).to(C.DEVICE)
     return tokenizer, llm
 
 

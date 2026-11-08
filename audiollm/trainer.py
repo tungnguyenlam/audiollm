@@ -12,7 +12,7 @@ import torch
 import runs as runs_lib
 from audiollm import config as C
 from audiollm.data import (SpeechDataset, create_dataloader, create_length_batched_sampler,
-                           create_token_batched_sampler, load_train_items, load_validation_items, parse_val_splits)
+                           create_token_batched_sampler, replay_epoch_indices, load_train_items, load_validation_items, parse_val_splits)
 from audiollm.evaluate import evaluate_dataset, format_eval_metrics, run_test_evaluation, val_hypotheses_path
 from audiollm.asr_noise import Noiser
 from audiollm.features import LogMelFeaturizer, SpecAugment, WaveAugment, compute_or_load_mvn_stats, load_run_mvn_stats
@@ -65,6 +65,17 @@ def build_lr_scheduler(optimizer, total_optimizer_steps):
 def make_epoch_sampler(train_items, sequence_lengths, epoch):
     """Batches (lists of item indices) for one epoch: fixed BATCH_SIZE, or BATCH_TOKENS padded positions."""
     seed = C.SEED + C.SHUFFLE_SEED_OFFSET + epoch
+    if C.REPLAY_SPLIT:
+        indices = replay_epoch_indices(train_items, epoch, C.REPLAY_FRACTION,
+                                       C.SEED + C.SHUFFLE_SEED_OFFSET)
+        subset = [train_items[i] for i in indices]
+        if C.BATCH_TOKENS:
+            lengths = [sequence_lengths[i] for i in indices]
+            batches = create_token_batched_sampler(subset, lengths, C.BATCH_TOKENS,
+                                                   chunk_size=C.BATCH_SIZE * 50, seed=seed)
+        else:
+            batches = create_length_batched_sampler(subset, C.BATCH_SIZE, seed=seed)
+        return [[indices[i] for i in batch] for batch in batches]
     if C.BATCH_TOKENS:
         return create_token_batched_sampler(train_items, sequence_lengths, C.BATCH_TOKENS,
                                             chunk_size=C.BATCH_SIZE * 50, seed=seed)
@@ -193,7 +204,7 @@ def train(args, run_dir, tracker, log_and_print, hub=None):
 
     # Steps: fixed batches give ceil(utts / BATCH_SIZE) per epoch; token batches are counted on epoch 0's sampler
     sequence_lengths = estimate_sequence_lengths(train_items, model, featurizer.frame_rate) if C.BATCH_TOKENS else None
-    if C.BATCH_TOKENS:
+    if C.BATCH_TOKENS or C.REPLAY_SPLIT:
         epoch_batches = make_epoch_sampler(train_items, sequence_lengths, 0)
         log_and_print(f"token batching: {len(epoch_batches)} batches/epoch, "
                       f"{len(train_items) / len(epoch_batches):.1f} utts/batch on average")
@@ -412,7 +423,7 @@ def train(args, run_dir, tracker, log_and_print, hub=None):
                 runs_lib.refresh_run_views(run_dir, log_and_print)
                 window = reset_window_stats()  # exclude eval time from training throughput
 
-            if C.CHECKPOINT_EVERY and optimizer_step % C.CHECKPOINT_EVERY == 0 and optimizer_step < total_optimizer_steps:
+            if C.CHECKPOINT_EVERY and optimizer_step % C.CHECKPOINT_EVERY == 0 and optimizer_step <= total_optimizer_steps:
                 if hub:
                     hub.wait()  # the upload reads checkpoint/, which save_checkpoint is about to replace
                 save_checkpoint(checkpoint_dir, model, optimizer, lr_scheduler, {
@@ -440,8 +451,12 @@ def train(args, run_dir, tracker, log_and_print, hub=None):
     )
 
     # Save trained LoRA adapter and projector; runs/latest_model -> the newest (non-smoke) run that has weights
+    if hub:
+        hub.wait()
     model.save(run_dir)
     tracker.update(weights_saved_step=optimizer_step)
+    if hub:
+        hub.push(f"trained weights at step {optimizer_step}", final=True)
     if not args.max_steps:
         runs_lib.update_latest_link(run_dir, "latest_model")
     log_and_print("saved", run_dir)
