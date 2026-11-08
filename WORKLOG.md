@@ -191,3 +191,31 @@ and the table are in `docs/literature_review.md` ("Novelty search 2026-11-04").
 - Resumed with `systemd-run --user --scope --unit=merge-stageC-tmux` + tmux `merge_stageC`. The runner skips completed rows.
   25 (k, E) pairs are left (50 runs), ~2.5-3 h.
 - AGENTS.md "Long-running jobs" now says to launch tmux via `systemd-run --user --scope`.
+
+## 2026-11-08 - Pivot to Vietnamese ASR for ZAC 2026 (until 11-15); LFM3 en/vi tokenizer graft
+- Merging research paused until 2026-11-15 for the Zalo AI Challenge LifeMate track (repo /home/nguyenlt/ZaloAI: ASR -> Qwen3.5-4B
+  agent, 6B cap). Target: a vi ASR that holds up on N/C/S accents and beats the Zipformer-30M baseline.
+- Parked (not feasible on the 230M model by 11-15): thinking mode (the Base model has none), looped/Dory-style depth recurrence,
+  on-policy distillation from LFM3-Audio-2B (the graft keeps LFM3 ids in graft_meta.json `lfm3_ids` so it can be done later).
+- `tools/build_vi_graft.py`: LFM2.5-230M + LFM3 tokenizer (same as LFM3-Audio-2B) pruned to en/vi/digits/punct, merge-closed:
+  45,755 vocab (vs 64.4k LFM2.5), 10,477 new rows initialised as the mean of their LFM2.5 sub-tokens. vi 3.23 -> 1.14 tok/word
+  (1.19 on ZAC). Tokenization matches LFM3 on 8999/9000 texts.
+- `tools/warmup_graft_embeddings.py`: text-only training of the new rows only (1500 steps): vi 1.119 nats/char vs 1.270 for LFM2.5;
+  English unchanged (2.659 vs 2.675 nats/tok). Log: results/vi_zac_20261108/warmup.log.
+- ZAC data (`tools/prepare_zac_asr.py`): train/dev(864)/holdout/public_test manifests with Zipformer hyps; 871 confusions mined
+  from train only. Zipformer on ZAC dev (our normaliser): 18.56% WER (N 15.95, C 22.86, S 19.72).
+- Old LFM vi run on ViMD test: 58.36 (N 53.87, C 60.54, S 61.92). Qwen vi run: 31.65 (N 27.54, C 36.19, S 32.46).
+  Per-region scorer: `tools/vi_region_wer.py`.
+
+## 2026-11-08 - vi_zac_graft run: augmentation + prompt-triggered ASR correction; launched
+- Code: WaveAugment (speed 0.9/1.0/1.1, ESC-50+Clotho noise bank 7.8 h at SNR 5-25 dB p 0.3, gain +-6 dB; `tools/build_noise_bank.py`);
+  correction mode (CORRECTION_P), prompt "ASR hypothesis:{hyp}\nCorrected transcription:", only when the prompt asks for it.
+  Hyps: real Zipformer (p 0.7 where available), else synthetic `audiollm/asr_noise.py` (mined confusions + dialect initial/final/tone
+  swaps), with 15% clean. Val/test splits with a `#corr` suffix evaluate correction mode.
+- Trainable fp32 tied embedding (TRAIN_EMBEDDINGS, lr x0.25, saved as embed.pt). The loss now projects only target positions through
+  lm_head. train.py accepts INIT_FROM whose MODEL is the graft's base.
+- Smoke run 20261108-092603_vi_zac_graft_smoke_smoke30: train/ckpt/eval OK in both modes; reload is exact.
+- Launched `configs/vi_zac_graft.json` (INIT_FROM vi500h_lfm_projE2_matched19k; mix500h + gigaspeech2/fleurs val + zac2026/train x10
+  + vimd x2; 16x2, 24k steps, lr 2e-4) at ~1.0 s/step, ETA ~7 h. Running in tmux `-L vi_zac -s vi_zac_graft` under systemd scope
+  vi-zac-graft2. Log: results/vi_zac_20261108/train.log.
+- Launch gotcha: the login shell is fish, so a tmux command with `source .venv/bin/activate` dies silently. Wrap it in `bash -c`.

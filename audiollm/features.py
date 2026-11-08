@@ -134,6 +134,12 @@ class LogMelFeaturizer:
     def from_waveform(self, waveform):
         return (log_mel_from_waveform(waveform) - self.mvn_stats["mean"]) / self.mvn_stats["std"]
 
+    @staticmethod
+    def load_waveform(audio_filepath):
+        waveform, sample_rate = sf.read(audio_filepath, dtype="float32")
+        assert sample_rate == C.SR, f"Expected sample rate {C.SR}, but got {sample_rate} for {audio_filepath}"
+        return waveform
+
     def __call__(self, audio_filepath):
         """(num_frames, feature_dim) normalised features of one audio file."""
         return (extract_log_mel_spectrogram(audio_filepath) - self.mvn_stats["mean"]) / self.mvn_stats["std"]
@@ -174,3 +180,58 @@ class SpecAugment:
         self._mask(features, 1, self.freq_masks, self.freq_width)
         self._mask(features, 0, self.time_masks, min(self.time_width, int(self.max_time_ratio * features.shape[0])))
         return features
+
+
+class WaveAugment:
+    """
+    Waveform-level train augmentation, applied before the log-mel (so it runs in DataLoader workers):
+    speed perturbation (WAVE_SPEEDS, resampled with linear interpolation; pitch moves with speed, Kaldi-style),
+    additive noise from a memory-mapped NOISE_BANK crop at an SNR drawn from NOISE_SNR with probability NOISE_P,
+    and a random gain of +-GAIN_DB dB. Randomness comes from torch's RNG (seeded per worker by the DataLoader).
+    """
+
+    def __init__(self, speeds, noise_bank, noise_p, snr_range, gain_db):
+        self.speeds, self.noise_bank_path, self.noise_p = speeds, noise_bank, noise_p
+        self.snr_lo, self.snr_hi = snr_range
+        self.gain_db = gain_db
+        self._bank = None
+
+    @classmethod
+    def from_config(cls):
+        speeds = [float(s) for s in C.WAVE_SPEEDS.split(",") if s.strip()]
+        noise_p = C.NOISE_P if C.NOISE_BANK else 0.0
+        if not (any(s != 1.0 for s in speeds) or noise_p > 0 or C.GAIN_DB > 0):
+            return None
+        snr = tuple(float(x) for x in C.NOISE_SNR.split(","))
+        return cls(speeds, C.NOISE_BANK, noise_p, snr, C.GAIN_DB)
+
+    def __repr__(self):
+        return (f"WaveAugment(speeds {self.speeds or [1.0]}, noise p {self.noise_p:g} at SNR {self.snr_lo:g}-{self.snr_hi:g} dB"
+                f" from {self.noise_bank_path or '-'}, gain +-{self.gain_db:g} dB)")
+
+    def bank(self):
+        if self._bank is None:
+            self._bank = np.load(self.noise_bank_path, mmap_mode="r")
+        return self._bank
+
+    def __call__(self, waveform):
+        wav = torch.from_numpy(np.ascontiguousarray(waveform, dtype=np.float32))
+        if self.speeds:
+            speed = self.speeds[int(torch.randint(len(self.speeds), ()))]
+            if speed != 1.0 and wav.numel() > 1:
+                new_len = max(1, int(round(wav.numel() / speed)))
+                wav = torch.nn.functional.interpolate(wav[None, None], size=new_len, mode="linear",
+                                                      align_corners=False)[0, 0]
+        if self.noise_p > 0 and float(torch.rand(())) < self.noise_p:
+            bank = self.bank()
+            n = wav.numel()
+            if len(bank) > n:
+                start = int(torch.randint(len(bank) - n, ()))
+                noise = torch.from_numpy(np.asarray(bank[start:start + n], dtype=np.float32))
+                snr_db = self.snr_lo + (self.snr_hi - self.snr_lo) * float(torch.rand(()))
+                p_sig = wav.pow(2).mean().clamp_min(1e-10)
+                p_noise = noise.pow(2).mean().clamp_min(1e-10)
+                wav = wav + noise * torch.sqrt(p_sig / (p_noise * 10 ** (snr_db / 10)))
+        if self.gain_db > 0:
+            wav = wav * 10 ** ((float(torch.rand(())) * 2 - 1) * self.gain_db / 20)
+        return wav.numpy()

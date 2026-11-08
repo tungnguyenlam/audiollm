@@ -83,6 +83,18 @@ SPECAUG_MAX_TIME_RATIO = 0.2 # each time mask covers at most this fraction of th
 # ------------------------------------------------------------------------------------------------
 
 # Model and optimization hyperparameters
+WAVE_SPEEDS = ""             # waveform speed perturbation on train utts: comma list of factors drawn uniformly, e.g. "0.9,1.0,1.1" (resampled, pitch shifts too, Kaldi-style); "" = off
+NOISE_BANK = ""              # .npy float16 noise waveform at SR (tools/build_noise_bank.py) for additive train noise; "" = off
+NOISE_P = 0.0                # probability that a train utt gets a random noise crop added (needs NOISE_BANK)
+NOISE_SNR = "5,25"           # SNR range in dB "lo,hi" for added noise, drawn uniformly
+GAIN_DB = 0.0                # random gain of +-GAIN_DB dB on train waveforms (0 = off; matters only through log-mel + MVN offset)
+CORRECTION_P = 0.0           # probability that a train utt is a correction example: [audio][CORRECTION_PROMPT with a noisy hypothesis] -> reference. 0 = off
+CORRECTION_PROMPT = "ASR hypothesis:{hyp}\nCorrected transcription:"  # correction-mode prompt; {hyp} = " " + hypothesis text (replaces PROMPT for those utts)
+CORRECTION_REAL_P = 0.7      # correction example from an utt whose manifest has a real ASR "hyp": use it with this probability, else a synthetic one
+CORRECTION_CLEAN_P = 0.15    # probability that a synthetic hypothesis is the reference itself (teach: copy when nothing is wrong)
+CORRECTION_CONFUSIONS = ""   # JSON of mined word confusions ({"categories": {cat: [{"ref","hyp","prob"}]}}) used by the synthetic noiser; "" = rule-based noise only
+TRAIN_EMBEDDINGS = False     # also train the (tied) input embedding / lm_head matrix (fp32 master copy), e.g. after a tokenizer graft; saved as embed.pt
+EMBED_LR_MULT = 0.25         # embedding lr = LR * EMBED_LR_MULT (TRAIN_EMBEDDINGS)
 PROMPT = "Transcription:"    # Text prompt prepended to transcriptions
 LORA_R = 64                  # LoRA rank dimension
 LORA_ALPHA = 128             # LoRA scaling factor (alpha)

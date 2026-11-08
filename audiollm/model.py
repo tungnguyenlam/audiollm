@@ -8,6 +8,7 @@ from collections import defaultdict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from audiollm import config as C
 from audiollm.backbone import attach_lora, describe_llm, describe_lora_placement, load_llm
@@ -44,14 +45,42 @@ class SpeechLLM(nn.Module):
         llm = attach_lora(llm, saved_run_dir, trainable)
         if saved_run_dir is not None:
             projector.load_checkpoint(torch.load(os.path.join(saved_run_dir, "proj.pt"), map_location=C.DEVICE))
-        return cls(tokenizer, llm, projector)
+        model = cls(tokenizer, llm, projector)
+        embed_path = os.path.join(saved_run_dir, "embed.pt") if saved_run_dir is not None else None
+        model.setup_embeddings(embed_path if embed_path and os.path.exists(embed_path) else None,
+                               trainable=trainable and C.TRAIN_EMBEDDINGS)
+        return model
+
+    def setup_embeddings(self, embed_path=None, trainable=False):
+        """
+        Load a run's trained (tied) embedding matrix from embed.pt and/or make it trainable (TRAIN_EMBEDDINGS): an fp32
+        master copy that both the input lookup and lm_head share. Without either, the backbone's weights stay as loaded.
+        """
+        embedding = self.llm.get_input_embeddings()
+        self.custom_embeddings = bool(embed_path) or trainable
+        if not self.custom_embeddings:
+            return
+        weight = torch.load(embed_path, map_location=C.DEVICE) if embed_path else embedding.weight.data
+        assert weight.shape == embedding.weight.shape, f"embed.pt {tuple(weight.shape)} vs model {tuple(embedding.weight.shape)}"
+        dtype = torch.float32 if trainable else embedding.weight.dtype
+        embedding.weight = nn.Parameter(weight.to(C.DEVICE, dtype), requires_grad=trainable)
+        output = self.llm.get_output_embeddings()
+        if getattr(self.llm.config, "tie_word_embeddings", False) and output is not None:
+            output.weight = embedding.weight
 
     def save(self, run_dir):
         self.llm.save_pretrained(os.path.join(run_dir, "lora"))
         torch.save(self.projector.state_dict(), os.path.join(run_dir, "proj.pt"))
+        if self.custom_embeddings:
+            torch.save(self.llm.get_input_embeddings().weight.data.to(C.DTYPE), os.path.join(run_dir, "embed.pt"))
+
+    def embedding_parameters(self):
+        weight = self.llm.get_input_embeddings().weight
+        return [weight] if weight.requires_grad else []
 
     def lora_parameters(self):
-        return [param for param in self.llm.parameters() if param.requires_grad]
+        embedding = self.llm.get_input_embeddings().weight
+        return [param for param in self.llm.parameters() if param.requires_grad and param is not embedding]
 
     def build_inputs(self, batch, is_train, audio_ablation="none"):
         """
@@ -77,19 +106,22 @@ class SpeechLLM(nn.Module):
 
         embed_tokens = self.llm.get_input_embeddings()
         has_bos = self.tokenizer.bos_token_id is not None
-        bos_prefix = [embed_tokens(torch.tensor([self.tokenizer.bos_token_id], device=C.DEVICE))] if has_bos else []
+        bos_prefix = ([embed_tokens(torch.tensor([self.tokenizer.bos_token_id], device=C.DEVICE)).to(C.DTYPE)]
+                      if has_bos else [])
         n_bos = int(has_bos)
+        row_prompts = batch.get("prompt_ids") or [None] * len(batch["target"])
         sequences, labels = [], []
         for row, target in enumerate(batch["target"]):
             audio_embeds = projected.embeds[row, :int(projected.lengths[row])].to(C.DTYPE)
-            text_token_ids = self.prompt_token_ids + (target if is_train else [])
-            text_embeds = embed_tokens(torch.tensor(text_token_ids, device=C.DEVICE))
+            prompt_ids = row_prompts[row] or self.prompt_token_ids
+            text_token_ids = prompt_ids + (target if is_train else [])
+            text_embeds = embed_tokens(torch.tensor(text_token_ids, device=C.DEVICE)).to(C.DTYPE)
             sequences.append(torch.cat([*bos_prefix, audio_embeds, text_embeds], dim=0))
             if is_train:
-                labels.append([-100] * (n_bos + audio_embeds.shape[0] + len(self.prompt_token_ids)) + target)
+                labels.append([-100] * (n_bos + audio_embeds.shape[0] + len(prompt_ids)) + target)
 
         max_len, hidden = max(seq.shape[0] for seq in sequences), sequences[0].shape[1]
-        pad_token_embed = embed_tokens(torch.tensor([self.pad_token_id], device=C.DEVICE))
+        pad_token_embed = embed_tokens(torch.tensor([self.pad_token_id], device=C.DEVICE)).to(C.DTYPE)
         inputs_embeds = pad_token_embed.expand(len(sequences), max_len, hidden).clone()
         attention_mask = torch.zeros(len(sequences), max_len, device=C.DEVICE, dtype=torch.long)
         target_labels = torch.full((len(sequences), max_len), -100, device=C.DEVICE, dtype=torch.long)
@@ -104,7 +136,15 @@ class SpeechLLM(nn.Module):
     def forward(self, batch):
         """Training loss (LM loss + projector aux loss) for a collated batch; also returns the masks and stats."""
         inputs_embeds, attention_mask, target_labels, projected = self.build_inputs(batch, is_train=True)
-        loss = self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=target_labels).loss
+        # lm_head only at the positions that predict a target token (not over audio/prompt/pad): same mean token CE as
+        # the HF loss, without materialising (batch, len, vocab) logits
+        causal_lm = self.llm.get_base_model()
+        hidden = causal_lm.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+                                 use_cache=False).last_hidden_state
+        shift_labels = target_labels[:, 1:]
+        predict_mask = shift_labels != -100
+        logits = causal_lm.lm_head(hidden[:, :-1][predict_mask]).float()
+        loss = F.cross_entropy(logits, shift_labels[predict_mask])
         if projected.aux_loss is not None:
             loss = loss + projected.aux_loss
         return loss, {"attention_mask": attention_mask, "target_labels": target_labels, "projected": projected}

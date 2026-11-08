@@ -66,10 +66,13 @@ def load_split(split_spec):
     Utterances for a split spec: a LibriSpeech split name ("train-clean-100"), an unpacked corpus split
     ("ami_ihm/train", see unpack_parquet_asr_corpora.py), or several of them joined with "+". A "*K" suffix
     ("fleurs_en/train*6") repeats that split's utterances K times; a fractional K adds a SEED-fixed random subset.
+    A "#corr" suffix ("zac2026/dev#corr") keeps only utterances whose manifest has an ASR "hyp" and marks them
+    mode="correct": they are decoded in correction mode (CORRECTION_PROMPT with that hypothesis).
     Returns the same dicts as load_librispeech_split(), with text normalised by normalize_training_text().
     """
     records = []
     for part in split_spec.split("+"):
+        part, _, mode = part.partition("#")
         name, _, weight_text = part.partition("*")
         weight = float(weight_text) if weight_text else 1.0
         if "/" in name:
@@ -80,6 +83,10 @@ def load_split(split_spec):
         for record in split_records:
             record["text"] = normalize_training_text(record["text"])
         split_records = [record for record in split_records if record["text"]]
+        if mode == "corr":
+            split_records = [dict(record, mode="correct") for record in split_records if record.get("hyp")]
+        elif mode:
+            raise ValueError(f"unknown split mode #{mode} in {split_spec!r} (expected #corr)")
         repeats, fraction = int(weight), weight - int(weight)
         records += split_records * repeats
         if fraction > 0:
@@ -88,8 +95,8 @@ def load_split(split_spec):
 
 
 def unweighted_split(split_spec):
-    """Split spec without "*K" weights: "a*2+b" -> "a+b"."""
-    return re.sub(r"\*[0-9.]+", "", split_spec)
+    """Split spec without "*K" weights or "#mode": "a*2+b#corr" -> "a+b"."""
+    return re.sub(r"#\w+", "", re.sub(r"\*[0-9.]+", "", split_spec))
 
 
 def parse_val_splits(val_split):
@@ -118,15 +125,39 @@ def load_train_items():
 # ---------------------------------------------------------------- dataset
 class SpeechDataset(torch.utils.data.Dataset):
     """
-    Utterance records -> {"features": (num_frames, feature_dim), "target": token ids + [EOS], "text", "id", "sec"}.
-    augment (e.g. features.SpecAugment, train set only) maps the features to augmented features of the same shape.
+    Utterance records -> {"features": (num_frames, feature_dim), "target": token ids + [EOS], "text", "id", "sec",
+    "prompt_ids" (None = the model's PROMPT)}.
+    augment (e.g. features.SpecAugment, train set only) maps the features to augmented features of the same shape;
+    wave_augment (features.WaveAugment, train only) maps the waveform before feature extraction.
+    noiser (asr_noise.Noiser, train only, with CORRECTION_P > 0) turns a fraction of utterances into correction
+    examples. An item with mode="correct" (eval, "#corr" splits) always uses correction mode with its manifest "hyp".
     """
 
-    def __init__(self, dataset_items, featurizer, tokenizer, augment=None):
+    def __init__(self, dataset_items, featurizer, tokenizer, augment=None, wave_augment=None, noiser=None):
         self.dataset_items = dataset_items
         self.featurizer = featurizer
         self.tokenizer = tokenizer
         self.augment = augment
+        self.wave_augment = wave_augment
+        self.noiser = noiser
+
+    def correction_hypothesis(self, item):
+        """Hypothesis text for this utterance's correction prompt, or None for plain transcription."""
+        if item.get("mode") == "correct":
+            return item["hyp"]
+        if self.noiser is None or random.random() >= C.CORRECTION_P:
+            return None
+        if item.get("hyp") and random.random() < C.CORRECTION_REAL_P:
+            return item["hyp"]
+        if random.random() < C.CORRECTION_CLEAN_P:
+            return item["text"]
+        return self.noiser.corrupt(item["text"])
+
+    def prompt_ids(self, hypothesis):
+        if hypothesis is None:
+            return None
+        prompt = C.CORRECTION_PROMPT.format(hyp=" " + hypothesis if hypothesis else "")
+        return self.tokenizer(prompt, add_special_tokens=False).input_ids
 
     def __len__(self):
         return len(self.dataset_items)
@@ -138,13 +169,17 @@ class SpeechDataset(torch.utils.data.Dataset):
             self.tokenizer(" " + item["text"], add_special_tokens=False).input_ids
             + [self.tokenizer.eos_token_id]
         )
-        features = self.featurizer(item["path"])  # (num_frames, feature_dim), full frame rate
+        if self.wave_augment is not None:
+            features = self.featurizer.from_waveform(self.wave_augment(self.featurizer.load_waveform(item["path"])))
+        else:
+            features = self.featurizer(item["path"])  # (num_frames, feature_dim), full frame rate
         return {
             "features": self.augment(features) if self.augment else features,
             "target": target_token_ids,
             "text": item["text"],
             "id": item["id"],
             "sec": item["sec"],
+            "prompt_ids": self.prompt_ids(self.correction_hypothesis(item)),
         }
 
 
@@ -157,7 +192,7 @@ def collate_speech_batch(items):
     features = items[0]["features"].new_zeros(len(items), int(feature_lengths.max()), items[0]["features"].shape[1])
     for row, item in enumerate(items):
         features[row, :item["features"].shape[0]] = item["features"]
-    batch = {key: [item[key] for item in items] for key in ("target", "text", "id", "sec")}
+    batch = {key: [item.get(key) for item in items] for key in ("target", "text", "id", "sec", "prompt_ids")}
     return dict(batch, features=features, feature_lengths=feature_lengths)
 
 

@@ -192,6 +192,10 @@ def resolve_init_from(config):
     init_config = C.with_legacy_defaults(json.load(open(Path(config[key], "config.json"))))
     mismatched = {name: (init_config.get(name), config[name]) for name in must_match
                   if name in init_config and init_config[name] != config[name]}
+    # A tokenizer graft (tools/build_vi_graft.py) of the init run's backbone has the same layers: LoRA transfers
+    graft_meta = Path(config["MODEL"], "graft_meta.json")
+    if "MODEL" in mismatched and graft_meta.exists() and json.loads(graft_meta.read_text())["base"] == init_config["MODEL"]:
+        mismatched.pop("MODEL")
     if mismatched:
         raise SystemExit(f"{key} {config[key]}: config differs from the init run as (init, now): "
                          f"{mismatched}; pass e.g. --config {config[key]}/config.json")

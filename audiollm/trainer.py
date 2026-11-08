@@ -14,14 +14,20 @@ from audiollm import config as C
 from audiollm.data import (SpeechDataset, create_dataloader, create_length_batched_sampler,
                            create_token_batched_sampler, load_train_items, load_validation_items, parse_val_splits)
 from audiollm.evaluate import evaluate_dataset, format_eval_metrics, run_test_evaluation, val_hypotheses_path
-from audiollm.features import LogMelFeaturizer, SpecAugment, compute_or_load_mvn_stats, load_run_mvn_stats
+from audiollm.asr_noise import Noiser
+from audiollm.features import LogMelFeaturizer, SpecAugment, WaveAugment, compute_or_load_mvn_stats, load_run_mvn_stats
 from audiollm.model import SpeechLLM
 from audiollm.utils import compute_context, format_duration, make_progress_bar
 
 
-def build_optimizer(lora_params, proj_params, log_and_print):
-    # Two param groups so the projector can get its own lr (PROJ_LR_MULT) and LoRA can start late (PROJ_ONLY_STEPS)
+def build_optimizer(lora_params, proj_params, log_and_print, embed_params=()):
+    # Two param groups so the projector can get its own lr (PROJ_LR_MULT) and LoRA can start late (PROJ_ONLY_STEPS);
+    # a third for the embedding matrix (TRAIN_EMBEDDINGS, EMBED_LR_MULT)
     param_groups = [{"params": lora_params}, {"params": proj_params}]
+    if embed_params:
+        if C.OPTIMIZER != "adamw":
+            raise ValueError("TRAIN_EMBEDDINGS needs OPTIMIZER='adamw'")
+        param_groups.append({"params": list(embed_params)})
     if C.OPTIMIZER == "adamw":
         return torch.optim.AdamW(param_groups, lr=C.LR, weight_decay=C.WEIGHT_DECAY, betas=(0.9, 0.999))
     if C.OPTIMIZER == "muon":
@@ -49,11 +55,11 @@ def build_lr_scheduler(optimizer, total_optimizer_steps):
             return 0.0
         return min(1.0, (step_idx - C.PROJ_ONLY_STEPS + 1) / max(1, C.WARMUP_STEPS)) * compute_lr_multiplier(step_idx)
 
-    return torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=[compute_lora_lr_multiplier if C.PROJ_ONLY_STEPS else compute_lr_multiplier,
-                   lambda step_idx: C.PROJ_LR_MULT * compute_lr_multiplier(step_idx)],
-    )
+    lambdas = [compute_lora_lr_multiplier if C.PROJ_ONLY_STEPS else compute_lr_multiplier,
+               lambda step_idx: C.PROJ_LR_MULT * compute_lr_multiplier(step_idx)]
+    if len(optimizer.param_groups) == 3:
+        lambdas.append(lambda step_idx: C.EMBED_LR_MULT * compute_lr_multiplier(step_idx))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas)
 
 
 def make_epoch_sampler(train_items, sequence_lengths, epoch):
@@ -173,13 +179,17 @@ def train(args, run_dir, tracker, log_and_print, hub=None):
 
     trainable_lora_params = model.lora_parameters()
     trainable_proj_params = [p for p in model.projector.parameters() if p.requires_grad]
+    trainable_embed_params = model.embedding_parameters()
     summary_text, param_counts = model.summary()
     for line in summary_text.splitlines():
         log_and_print(line)
     (run_dir / "model_summary.txt").write_text(summary_text + "\n")
     tracker.update(**param_counts)
 
-    optimizer = build_optimizer(trainable_lora_params, trainable_proj_params, log_and_print)
+    optimizer = build_optimizer(trainable_lora_params, trainable_proj_params, log_and_print, trainable_embed_params)
+    if trainable_embed_params:
+        log_and_print(f"training the embedding matrix too ({trainable_embed_params[0].numel() / 1e6:.1f}M, fp32, "
+                      f"lr x{C.EMBED_LR_MULT})")
 
     # Steps: fixed batches give ceil(utts / BATCH_SIZE) per epoch; token batches are counted on epoch 0's sampler
     sequence_lengths = estimate_sequence_lengths(train_items, model, featurizer.frame_rate) if C.BATCH_TOKENS else None
@@ -200,8 +210,16 @@ def train(args, run_dir, tracker, log_and_print, hub=None):
                       f"audio ablations {val_ablations or 'none'}")
 
     augment = SpecAugment.from_config()
-    log_and_print(f"train augmentation: {augment or 'none'}")
-    train_dataset = SpeechDataset(train_items, featurizer, model.tokenizer, augment=augment)
+    wave_augment = WaveAugment.from_config()
+    noiser = Noiser(C.CORRECTION_CONFUSIONS) if C.CORRECTION_P > 0 else None
+    log_and_print(f"train augmentation: {augment or 'no SpecAugment'} | {wave_augment or 'no waveform augmentation'}")
+    if noiser:
+        n_real = sum(1 for item in train_items if item.get("hyp"))
+        log_and_print(f"correction mode: p {C.CORRECTION_P:g} with prompt {C.CORRECTION_PROMPT!r}; real hyps on {n_real} "
+                      f"train utts (used with p {C.CORRECTION_REAL_P:g}), else synthetic (clean p {C.CORRECTION_CLEAN_P:g}, "
+                      f"{len(noiser.confusions)} mined confusion words)")
+    train_dataset = SpeechDataset(train_items, featurizer, model.tokenizer, augment=augment, wave_augment=wave_augment,
+                                  noiser=noiser)
 
     optimizer_step = 0
     micro_step = 0
@@ -281,6 +299,8 @@ def train(args, run_dir, tracker, log_and_print, hub=None):
             lora_grad_norm = (torch.nn.utils.clip_grad_norm_(trainable_lora_params, C.GRAD_CLIP).item()
                               if trainable_lora_params and optimizer_step >= C.PROJ_ONLY_STEPS else 0.0)
             proj_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_proj_params, C.GRAD_CLIP).item()
+            if trainable_embed_params:
+                torch.nn.utils.clip_grad_norm_(trainable_embed_params, C.GRAD_CLIP)
             grad_norm = math.hypot(lora_grad_norm, proj_grad_norm)
             optimizer.step()
             lr_scheduler.step()

@@ -27,8 +27,10 @@ grep -n -i 'projector' WORKLOG.md docs/worklog_archive/*.md | tail   # older his
   `systemd-run --user --scope` so the tmux server gets its own scope:
   ```bash
   systemd-run --user --scope --unit=<name> --collect \
-    tmux new-session -d -s <session_name> 'cd <repo> && source .venv/bin/activate && python train.py ...'
+    tmux -L <socket> new-session -d -s <session_name> "bash -c 'cd <repo> && source .venv/bin/activate && python train.py ...'"
   ```
+- The login shell is fish: without `bash -c`, `source .venv/bin/activate` fails and the session exits silently. Use a dedicated
+  `-L <socket>`, because otherwise the session joins an already-running tmux server in some other scope.
 - **Rationale:** agent tool processes run inside transient systemd scopes (`t3code-*.scope`), and the whole
   scope is killed when the agent session ends. A plain `tmux new-session` run from the agent shell starts the
   tmux server *inside* that scope, so the job still dies. This killed the Stage C merge sweep on 2026-11-07.
