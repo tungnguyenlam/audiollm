@@ -301,3 +301,29 @@ and the table are in `docs/literature_review.md` ("Novelty search 2026-11-04").
   they do not fix this. amp already runs matmuls in bf16.
 - Relaunched: tmux -L vi_en20_b32a3, scope vi-en20-b32a3-tmux; log results/vi_en_replay_20261108/train_b32a3.log.
   ~2.45 s/step, ETA ~65-70 h (b24 run: ~60 h).
+
+## 2026-11-10 - Convergence research for the ZAC dev plateau (no code changes)
+- vi_full_en20_cycle_b32a3 @54.8k: train loss 2.13 -> 0.70, ZAC dev[:300] flat ~41-42 (best 39.27 @18k); public VI sets still improving.
+- Root-cause candidates: zac2026/train is 4.8 h = ~1% of batches; audio prefix uses causal attention; every step is clipped (gnorm ~2 > 1.0).
+- Literature with verified numbers: bidirectional audio attention (DOTA 2402.00235), aux CTC 0.3 on speech positions (2602.12546).
+- Candidate next steps (not yet decided): ZAC upsampling / a ZAC-heavy final stage; prefix-LM mask over audio; aux CTC head;
+  averaging existing checkpoints; LoRA+/higher LoRA LR. Report: results/convergence_research_20261110/report.md
+
+## 2026-11-10 - ZAC dev error breakdown: is "thinking" worth it?
+- Script: results/convergence_research_20261110/error_breakdown.py over val_hyps of run 20261108-175503 (300-utt dev subset).
+- ASR @54k: WER 40.9 (S 1519 / D 123 / I 157 of 4398 words). Only 56 subs (4%, 1.3 WER pts) are tone/diacritic-only;
+  one utterance decoded as English. Similar at 18k (39.3, 4% diacritic-only).
+- Correction mode @54k: 21.2 vs untouched Zipformer hyps 18.87 on the same subset, so the model does worse than the draft it is given.
+- Reading: errors are whole-word acoustic misrecognitions, not reasoning or orthography; text CoT has nothing to reason from.
+  Cheapest "thinking" test proposed: self-refine (feed own ASR hyps into correction mode). Not run.
+
+## 2026-11-10 - Stopped b32a3 at 55.3k; relaunched with ZAC oversampled x8 (vi_full_en20_zac8)
+- User asked to stop and continue with ZAC oversampling. b32a3 (run 20261108-175503) stopped by SIGINT at step 55339; last
+  checkpoint 55000 copied to runs/20261108-175503_vi_full_en20_cycle_b32a3/init_step55000 (lora/proj/embed + config/mvn).
+- New config configs/vi_full_en20_zac8.json: TRAIN_SPLIT zac2026/train*8 (28,416 ZAC items/epoch, ~9.4% of VI, ~7.5% of
+  utterances incl. 20% EN replay; was ~1%), INIT_FROM init_step55000 (fresh AdamW + schedule), LR 3e-5 cosine (b32a3 was at
+  2.1e-5), WARMUP 333, TRAIN_STEPS 16000 (~4 epochs, each ZAC utt seen ~32x, ~11 h), EVAL_EVERY/CHECKPOINT_EVERY 1000.
+- Overfitting on 4.8 h of ZAC is the main risk: results/vi_zac8_20261110/snapshot_watch.sh copies every checkpoint into
+  <run>/snapshots/step_N so the best ZAC-dev step can be picked (b32a3 lost its early weights to rotation).
+- tmux -L vi_zac8 (scope vi-zac8-tmux), watcher tmux -L vi_zac8_snap (scope vi-zac8-snap); log results/vi_zac8_20261110/train.log.
+- Baseline to beat: ZAC dev[:300] 39.27 (b32a3 @18k), 40.9 @54k; full dev Zipformer 18.56.
