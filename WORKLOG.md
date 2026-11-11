@@ -327,3 +327,21 @@ and the table are in `docs/literature_review.md` ("Novelty search 2026-11-04").
   <run>/snapshots/step_N so the best ZAC-dev step can be picked (b32a3 lost its early weights to rotation).
 - tmux -L vi_zac8 (scope vi-zac8-tmux), watcher tmux -L vi_zac8_snap (scope vi-zac8-snap); log results/vi_zac8_20261110/train.log.
 - Baseline to beat: ZAC dev[:300] 39.27 (b32a3 @18k), 40.9 @54k; full dev Zipformer 18.56.
+
+## 2026-11-11 - ZAC dropped; back to merging research; Stage C in-LLM sweep result (was unlogged)
+- User decision: drop the Zalo AI Challenge and return to audio-token compression with a paper as the goal. The research
+  question, method and target results are under discussion; a root `PLAN.md` will replace `docs/adaptive_merging_plan.md`.
+- `vi_zac8` (run 20261110-072427) finished and benchmarked: gigaspeech2_vi 33.15, fleurs_vi 31.33, vimd 32.53, lsvsc 12.42,
+  phoaudiobook 8.02. GPU is free.
+- The Stage C training-free in-LLM sweep finished on 11-08 01:09 (64 runs, `results/merge_in_llm_stageC_20261107/summary.md`)
+  but was never logged. Unmerged 29.23. Affinity dev mean WER by merge layer k:
+  - E=0.93: k0 29.21, k2 29.41, k4 29.46, k6 30.39, k8 37.15, k10 43.25
+  - E=0.87: k0 29.48, k2 30.29, k4 31.52, k6 36.40, k8 55.58, k10 73.00
+  - E=0.80: k0 32.57, k2 35.05, k4 38.74, k6 47.95, k8 83.14
+- Reading: on the converged model k=0 is best at every E, so E2's "k=2 is the optimum" (-0.33) was noise. Even at equal keep
+  ratio R≈0.76, which ignores that deeper merges save less, k=0..6 tie at ~35-36 and k=8/10 are far worse (~46 / 43).
+- The affinity advantage over `uniform_matched` shrinks with depth (E=0.87: -8.8 at k0, -5.2 at k6, -2.2 at k8) and reverses
+  at k10 (+6.5). Dropping all audio after layer 10 still gives ~104% WER, so audio is read until the last attention layers.
+- Consequence: adjacent similarity rises with depth (11-04 probe) but merge tolerance does not. Training-free evidence does
+  not support "merge at the end of the implicit encoder"; placement becomes an ablation, not the headline.
+- Still missing: the silence-aware fixed-rate control (11-04) and any *trained* fixed-rate model at a lower rate.
